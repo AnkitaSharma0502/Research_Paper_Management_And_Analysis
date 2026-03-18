@@ -33,7 +33,7 @@ Link:https://researchpapermanagementandanalysis-ke6tnztrz7kma55zwlazse.streamlit
 
 ---
 
-## 🛠️ Tech Stack
+##  Tech Stack
 
 | Layer | Technology |
 |---|---|
@@ -42,19 +42,19 @@ Link:https://researchpapermanagementandanalysis-ke6tnztrz7kma55zwlazse.streamlit
 | **Vector Store** | FAISS |
 | **PDF Parsing** | PyMuPDF (fitz) |
 | **Orchestration** | LangChain |
-| **External Tools** | Semantic Scholar API, Tavily Search |
+| **External Tools** | Tavily Search |
 | **Frontend** | Streamlit |
-| **Data Models** | Pydantic v2 |
+| **Data Models** | Pydantic  |
 
 ---
 
-## 📁 Project Structure
+##  Project Structure
 
 ```
 research_intelligence_system/
 │
 ├── analytics/
-│   └── trends.py              # Trend analysis, citation graphs, topic distribution
+│   └── trends.py              # Trend analysis, citation table, topic distribution
 │
 ├── core/
 │   ├── parser.py              # PDF parsing, section extraction, metadata extraction
@@ -76,20 +76,22 @@ research_intelligence_system/
 │   ├── chat_view.py           # Chat assistant with 3 modes + web fallback
 │   └── analytics_view.py      # Trend charts, topic categories, citation network
 │
-├── .env                       # API keys (not committed)
+├── .env                       
 ├── app.py                     # Streamlit entry point
 └── requirements.txt
 ```
 
+---
+## High level Architecture
 
-
-| Value | Used For | Requires |
-|---|---|---|
-| _(not set)_ | Local development | Nothing extra |
-| `huggingface_api` | Cloud deployment | `HUGGINGFACEHUB_API_TOKEN` |
+ <img width="1174" height="704" alt="image" src="https://github.com/user-attachments/assets/b98e141a-c33e-4dc3-9b05-6cc03e2291d6" />
 
 ---
+## Low Level Architecture
 
+<img width="1265" height="540" alt="image" src="https://github.com/user-attachments/assets/ee284885-777b-406c-9c70-63230bc00b7d" />
+
+---
 ##  How to Use
 
 ### Uploading Papers
@@ -118,29 +120,7 @@ The system will:
 4. **Emerging Trends** tab — filter by year to see newest papers
 5. **Citation Network** tab — explore citation relationships
 
----
 
-## 📦 Requirements
-
-```txt
-streamlit>=1.35.0
-pandas
-pydantic>=2.0.0
-python-dotenv>=1.0.0
-langchain>=0.3.0
-langchain-community>=0.3.0
-langchain-core>=0.3.0
-langchain-text-splitters>=0.3.0
-langchain-groq>=0.2.0
-langchain-tavily>=0.1.0
-langchain-huggingface>=0.1.0
-sentence-transformers
-faiss-cpu>=1.8.0
-pymupdf>=1.24.0
-requests
-```
-
----
 
 ##  Limitations
 
