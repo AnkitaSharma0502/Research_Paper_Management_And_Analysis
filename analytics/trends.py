@@ -1,6 +1,22 @@
+import re
 from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional
-from models.schemas import ResearchPaper
+from models.schemas import ResearchPaper, Citation
+
+
+def _normalize_title(s: str) -> str:
+    """Lowercase, strip punctuation/whitespace for fuzzy matching."""
+    s = s.lower()
+    s = re.sub(r'[^\w\s]', ' ', s)
+    s = re.sub(r'\s+', ' ', s).strip()
+    return s
+
+
+def _ref_contains_title(ref: str, title_norm: str) -> bool:
+    """True if a normalized title appears as a substring of a normalized ref."""
+    if len(title_norm) < 8:
+        return False  # too short to match reliably
+    return title_norm in _normalize_title(ref)
 
 
 class TrendAnalyzer:
@@ -228,52 +244,83 @@ class TrendAnalyzer:
 
     def get_citation_graph(self) -> Dict[str, Dict[str, Any]]:
         """
-        Builds a bidirectional citation adjacency structure.
+        Builds a bidirectional citation adjacency structure by FUZZY-matching
+        each paper's reference strings against every other paper's title.
+
+        Reference strings look like '[1] Tosi S. Matplotlib for Python Developers'
+        — never an exact equality with a title. We lowercase, strip punctuation,
+        and check substring containment.
+
+        Side effect: also populates `paper.citations` (List[Citation]) for each
+        paper that wasn't already populated.
 
         Returns:
             {
               "Paper Title A": {
-                "references": ["Paper B", "Paper C"],
-                "cited_by":   ["Paper D"]
+                "references": ["Paper B", "Paper C"],   # resolved local titles
+                "cited_by":   ["Paper D"],
+                "raw_references": ["[1] Tosi S...", ...] # full original strings
               },
               ...
             }
         """
         graph: Dict[str, Dict] = {
             paper.title: {
-                "references": paper.references,
-                "cited_by":   [],
+                "references":      [],
+                "cited_by":        [],
+                "raw_references":  paper.references,
             }
             for paper in self.papers
         }
 
-        # Build reverse edges
+        # Pre-normalize every local title once.
+        title_norm = {p.title: _normalize_title(p.title) for p in self.papers}
+
+        # For each paper, resolve which of its raw reference strings point at
+        # another local paper and emit Citation objects + graph edges.
         for paper in self.papers:
-            for ref_title in paper.references:
-                if ref_title in graph:
-                    graph[ref_title]["cited_by"].append(paper.title)
-                else:
-                    graph[ref_title] = {
-                        "references": [],
-                        "cited_by":   [paper.title],
-                    }
+            resolved_titles: List[str] = []
+            citations: List[Citation] = []
+            for ref in paper.references:
+                for other in self.papers:
+                    if other.title == paper.title:
+                        continue
+                    if _ref_contains_title(ref, title_norm[other.title]):
+                        resolved_titles.append(other.title)
+                        citations.append(Citation(
+                            source_paper_id    = paper.paper_id,
+                            target_paper_title = other.title,
+                            target_paper_id    = other.paper_id,
+                            context            = ref[:200],
+                        ))
+                        # Reverse edge — other paper is cited by this one.
+                        if paper.title not in graph[other.title]["cited_by"]:
+                            graph[other.title]["cited_by"].append(paper.title)
+                        break  # one local match per ref is enough
+
+            graph[paper.title]["references"] = list(dict.fromkeys(resolved_titles))
+            # Backfill `paper.citations` only if empty (don't overwrite anything
+            # a future ingestion step might populate).
+            if not paper.citations:
+                paper.citations = citations
 
         return graph
 
     def get_most_referenced_external(self, top_n: int = 10) -> List[Dict[str, Any]]:
         """
-        Returns external papers (not in local library) most referenced
-        across all papers in the library.
-
-        Returns:
-            [ {"title": "...", "cited_by_count": 3}, ... ]
+        Returns reference strings that don't match any local paper title,
+        ranked by frequency. Uses the same fuzzy-match logic as the citation
+        graph so a renamed local paper isn't double-counted as external.
         """
-        local_titles = {paper.title for paper in self.papers}
+        title_norm = {p.title: _normalize_title(p.title) for p in self.papers}
         ref_counts: Counter = Counter()
 
         for paper in self.papers:
             for ref in paper.references:
-                if ref not in local_titles:
+                matched_local = any(
+                    _ref_contains_title(ref, tn) for tn in title_norm.values()
+                )
+                if not matched_local:
                     ref_counts[ref] += 1
 
         return [

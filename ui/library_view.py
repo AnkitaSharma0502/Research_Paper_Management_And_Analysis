@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 from core.parser import PDFParser
+import hashlib
 import tempfile
 import os
 import re
@@ -9,31 +10,6 @@ import re
 # ------------------------------------------------------------------ #
 #  HELPERS
 # ------------------------------------------------------------------ #
-
-def _smart_truncate(text: str, limit: int = 300) -> str:
-    """
-    Truncates text at the last complete sentence within the limit.
-    Prevents mid-sentence cuts in the UI.
-
-    How it works:
-    - If text is already short enough, return as-is
-    - Otherwise cut at `limit` characters
-    - Walk backwards from cut point to find the last period
-    - Cut there so we never end mid-sentence
-    """
-    if len(text) <= limit:
-        return text
-
-    truncated   = text[:limit]
-    last_period = truncated.rfind('.')   # find last sentence ending
-
-    if last_period > limit // 2:
-        # Only cut at period if it's in the second half of the text
-        # (avoids cutting too early if the first sentence is very long)
-        return truncated[:last_period + 1] + " ..."
-
-    return truncated + "..."
-
 
 def _extract_doi(text: str):
     """Extracts a DOI from a reference string if present."""
@@ -79,20 +55,6 @@ def _reading_progress(paper_store: dict) -> dict:
 
 
 # ------------------------------------------------------------------ #
-#  SECTIONS TO SKIP IN THE SECTION VIEWER
-# ------------------------------------------------------------------ #
-
-SKIP_SECTIONS = {
-    "header/metadata",
-    "references",       # catches: "6. References", "References and Notes", etc.
-    "bibliography",     # alternate name for references
-    "works cited",      # another alternate name
-    "abstract",         # shown in its own dedicated box above
-    "introduction",     # often duplicates abstract content in short papers
-}
-
-
-# ------------------------------------------------------------------ #
 #  MAIN RENDER
 # ------------------------------------------------------------------ #
 
@@ -132,7 +94,9 @@ def render(indexer, paper_store: dict):
             else:
                 progress_bar = st.progress(0, text="Starting...")
                 total_files  = len(uploaded_files)
-                indexed_ids  = {p.paper_id for p in paper_store.values()}
+                # Dedupe by content hash so renamed copies don't slip through
+                # and same-named different papers don't collide.
+                indexed_ids  = set(paper_store.keys())
 
                 for i, uploaded_file in enumerate(uploaded_files):
                     progress_bar.progress(
@@ -140,23 +104,27 @@ def render(indexer, paper_store: dict):
                         text=f"Parsing {uploaded_file.name}..."
                     )
 
-                    if uploaded_file.name in indexed_ids:
+                    pdf_bytes  = uploaded_file.getvalue()
+                    content_id = hashlib.sha1(pdf_bytes).hexdigest()[:12]
+
+                    if content_id in indexed_ids:
                         st.info(f"⏭️ Already indexed: {uploaded_file.name}")
                         continue
 
                     tmp_path = None
                     try:
                         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-                            tmp.write(uploaded_file.getvalue())
+                            tmp.write(pdf_bytes)
                             tmp_path = tmp.name
 
                         with PDFParser(tmp_path) as parser:
                             paper_obj = parser.parse(
-                                paper_id=uploaded_file.name,
+                                paper_id=content_id,
                                 llm=st.session_state.rag_engine.llm,
                             )
 
                         paper_store[paper_obj.paper_id] = paper_obj
+                        indexed_ids.add(paper_obj.paper_id)
                         indexer.index_paper(paper_obj)
                         st.success(f"✅ Indexed: {paper_obj.title or uploaded_file.name}")
 
@@ -193,11 +161,6 @@ def render(indexer, paper_store: dict):
 
     df = pd.DataFrame(data)
 
-    # st.info(
-    #     "💡 Edit **Year**, **Venue**, and **Status** inline. "
-    #     "Click **Sync Metadata** to save."
-    # )
-
     edited_df = st.data_editor(
         df,
         column_config={
@@ -219,18 +182,19 @@ def render(indexer, paper_store: dict):
 
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("💾 Sync Library Metadata", use_container_width=True):
+        if st.button("💾 Sync Metadata", use_container_width=True):
             for _, row in edited_df.iterrows():
                 p_id = row["ID"]
                 if p_id in paper_store:
-                    paper_store[p_id].year           = int(row["Year"]) if row["Year"] else None
+                    year_val = row["Year"]
+                    paper_store[p_id].year           = int(year_val) if pd.notna(year_val) else None
                     paper_store[p_id].venue          = row["Venue"] or None
                     paper_store[p_id].reading_status = row["Status"]
             st.success("✅ Metadata synced!")
             st.rerun()
 
     with col2:
-        if st.button("🗑️ Clear All Papers", use_container_width=True):
+        if st.button("🗑️ Clear All", use_container_width=True):
             st.session_state.paper_store = {}
             indexer.clear_index()
             st.rerun()
@@ -272,51 +236,31 @@ def render(indexer, paper_store: dict):
     with st.expander("📄 Abstract", expanded=True):
         st.write(paper.abstract or "No abstract available.")
 
-    # ── Sections with Show More / Show Less ───────────────────────────
-    with st.expander("📑 Sections"):
-        rendered = 0
-
-        for idx, section in enumerate(paper.sections):
-
-            # --- SUBSTRING matching instead of exact match ──
-            #  check if any skip-word appears INSIDE the section name
-            #      → catches all variants regardless of numbering or suffix
-            if any(skip in section.section_name.lower() for skip in SKIP_SECTIONS):
-                continue
-
-            rendered += 1
-            st.markdown(f"**{section.section_name}**")
-
-            content    = section.content
-            is_long    = len(content) > 300
-            toggle_key = f"expand_{selected_id}_{idx}_{section.section_name}"
-
-            if toggle_key not in st.session_state:
-                st.session_state[toggle_key] = False
-
-            if is_long and not st.session_state[toggle_key]:
-                # Show truncated version with "Show more" button
-                st.write(_smart_truncate(content, 300))
-                if st.button(
-                    "Show more ▼",
-                    key=f"btn_more_{selected_id}_{idx}_{section.section_name}",
-                ):
-                    st.session_state[toggle_key] = True
-                    st.rerun()
+    # ── AI Summary (generate on demand, cached per paper) ─────────────
+    summary_key = f"summary_{selected_id}"
+    with st.expander("✨ AI Summary"):
+        cached = st.session_state.get(summary_key)
+        if cached:
+            st.markdown(cached)
+            if st.button("🔄 Regenerate", key=f"regen_{selected_id}"):
+                st.session_state.pop(summary_key, None)
+                st.rerun()
+        else:
+            if st.button("Generate Summary", key=f"gen_{selected_id}", type="primary"):
+                rag_engine = st.session_state.get("rag_engine")
+                if rag_engine is None:
+                    st.error("RAG engine not initialised.")
+                else:
+                    with st.spinner("Generating summary..."):
+                        try:
+                            summary = rag_engine.generate_summary(paper)
+                            st.session_state[summary_key] = summary
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Failed to generate summary: {e}")
             else:
-                # Show full content with "Show less" button
-                st.write(content)
-                if is_long and st.button(
-                    "Show less ▲",
-                    key=f"btn_less_{selected_id}_{idx}_{section.section_name}",
-                ):
-                    st.session_state[toggle_key] = False
-                    st.rerun()
+                st.caption("Click to generate a Short + Structured summary using the LLM.")
 
-            st.divider()
-
-        if rendered == 0:
-            st.info("No additional sections found beyond Abstract.")
 
     # ── References with clickable DOI/URL links ───────────────────────
     with st.expander("🔗 References"):

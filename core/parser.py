@@ -1,897 +1,844 @@
-import fitz           # PyMuPDF — reads PDF files
-import re            
-import uuid           # Generates unique IDs for each paper
-import unicodedata    # Handles special characters like ligatures, dashes, etc.
-from collections import Counter, defaultdict   # Counter counts items, defaultdict is a dict with defaults
-from typing import List, Dict, Optional, Tuple
+import fitz
+import re
+import uuid
+import json
+import unicodedata
+from dataclasses import dataclass
+from collections import Counter, defaultdict
+from typing import List, Dict, Optional, Tuple, Any
+
 from models.schemas import ResearchPaper, PaperSection
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  CONSTANTS
+# ─────────────────────────────────────────────────────────────────────
 
 KNOWN_HEADINGS = [
     "abstract", "introduction", "background", "related work",
-    "literature review", "methodology", "proposed work", "method",
-    "approach", "system design", "architecture", "framework",
-    "experiments", "experimental setup", "experimental results",
-    "results", "evaluation", "discussion", "conclusion",
-    "future work", "acknowledgements", "acknowledgments", "references",
-    "bibliography", "works cited",   # added: other names for reference sections
+    "literature review", "methodology", "materials and methods",
+    "proposed work", "method", "methods", "approach", "system design",
+    "architecture", "framework", "model", "training", "preliminaries",
+    "problem statement", "experiments", "experimental setup",
+    "experimental results", "results", "findings", "evaluation",
+    "ablation", "ablation study", "analysis", "case study",
+    "discussion", "conclusion", "conclusions", "limitations",
+    "future work", "acknowledgements", "acknowledgments",
+    "references", "bibliography", "works cited", "data", "dataset",
+    "threat model",
 ]
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  REFERENCE PATTERNS
-#  Different papers use different citation styles.
-#  We try each pattern and use whichever one gets at least 2 matches.
-#
-#  Pattern 1: [1] Author et al. ...         ← IEEE / most CS papers
-#  Pattern 2: 1. Author Name. ...           ← Numbered without brackets
-#  Pattern 3: Author, F. Title ...          ← Author-last-name-first style
-#  Pattern 4: ... (2020). or (2020),        ← APA / author-year style
-#  Pattern 5: 1. Smith JA, Jones B. ...     ← Vancouver / medical style
-#  Pattern 6: Smith J (2017) Title ...      ← Author-year without parens
-# ──────────────────────────────────────────────────────────────────────────────
+KNOWN_HEADINGS_SET = {h.lower() for h in KNOWN_HEADINGS}
 
 REFERENCE_PATTERNS = [
-    r'^\[\d+\]\s+.{10,}',                          # [1] ...
-    r'^\d+\.\s+[A-Z].{10,}',                       # 1. Author ...
-    r'^[A-Z][a-z]+,\s+[A-Z]\.?.{10,}',             # Smith, J. ...
-    r'.{10,}\(\d{4}\)[.,].{5,}',                   # ... (2020). ...
-    r'^\d+\.\s+[A-Z][a-z]+\s+[A-Z]{1,3}[.,].{5,}',# 1. Smith JA, ... 
-    r'^[A-Z][a-z]+\s+[A-Z]+\s+\(\d{4}\).{5,}',    # Smith J (2017) ... 
+    r'^\[\d+\]\s+.{10,}',
+    r'^\d+\.\s+[A-Z].{10,}',
+    r'^[A-Z][a-z]+,\s+[A-Z]\.?.{10,}',
+    r'.{10,}\(\d{4}\)[.,].{5,}',
+    r'^\d+\.\s+[A-Z][a-z]+\s+[A-Z]{1,3}[.,].{5,}',
+    r'^[A-Z][a-z]+\s+[A-Z]+\s+\(\d{4}\).{5,}',
 ]
 
+VENUE_TOKENS = (
+    r'(Proceedings of|Journal of|Conference on|Workshop on|Transactions on|'
+    r'arXiv:\d{4}\.\d{4,5}|bioRxiv|medRxiv|IEEE|ACM|ICML|NeurIPS|CVPR|ICCV|'
+    r'ECCV|ACL|NAACL|EMNLP|ICLR|AAAI|KDD|SIGIR|WWW|TACL|'
+    r'Findings of (?:ACL|EMNLP|NAACL)|Springer|Elsevier|Nature|Science|'
+    r'PLOS|PLoS|Cell|Lancet)'
+)
 
-class PDFParser:
+AFFIL_RE = re.compile(
+    r'university|institute|department|college|school|laboratory|\blab\b|'
+    r'center|centre|faculty|@|\.com|\.edu|\.org|\bcorp\b|\binc\b|\bltd\b',
+    re.IGNORECASE,
+)
 
-    def __init__(self, file_path: str):
-        self.file_path = file_path
-        self.doc       = fitz.open(file_path)       # Open the PDF file
-        self.pdf_type  = self._detect_pdf_type()    # Figure out what kind of PDF it is
+# OS/default usernames that commonly leak into PDF Author metadata.
+JUNK_AUTHOR_TOKENS = {
+    "hp", "user", "admin", "administrator", "owner", "pc", "dell",
+    "lenovo", "acer", "asus", "windows", "root", "guest", "default",
+    "microsoft office user", "ms office user", "office user",
+}
 
-    # ================================================================== #
-    #  STEP 1 — DETECT PDF TYPE  
-    #  - Look at the first page's text blocks
-    #  - If blocks exist on BOTH left and right halves → two_column
-    #  - If NO blocks at all → scanned (image-only, can't extract text)
-    #  - Otherwise → normal single-column text
-    # ================================================================== #
+YEAR_MIN = 1950
+YEAR_MAX = 2030
 
-    def _detect_pdf_type(self) -> str:
-        if len(self.doc) == 0:
-            return "scanned"
+HEADING_ACCEPT_THRESHOLD = 0.50   # tunable
 
-        page        = self.doc[0]
-        # get_text("blocks") returns rectangles of text.
-        # b[6] == 0 means it's a text block (not an image block)
-        # b[4] is the actual text content of that block
-        text_blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
 
-        if not text_blocks:
-            return "scanned"
+# ─────────────────────────────────────────────────────────────────────
+#  DATA STRUCTURES
+# ─────────────────────────────────────────────────────────────────────
 
-        # Split the page down the middle and count blocks on each side
-        mid_x        = page.rect.width * 0.45
-        left_blocks  = [b for b in text_blocks if b[0] < mid_x]
-        right_blocks = [b for b in text_blocks if b[0] > mid_x]
+@dataclass
+class Line:
+    text: str
+    page: int
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    size: float
+    bold: bool
+    page_width: float
+    page_height: float
 
-        # If there are 3+ blocks on BOTH sides, it's a two-column layout
-        if len(left_blocks) >= 3 and len(right_blocks) >= 3:
-            return "two_column"
 
-        return "text"
+@dataclass
+class Extracted:
+    value: Any
+    confidence: float
+    source: str
 
-    # ================================================================== #
-    #  STEP 2 — TEXT EXTRACTION
-    #  IMPORTANT RULE: Always use get_text("text") for actual content.
-    #  Never manually join spans — that causes garbage characters.
-    #
-    #  For two-column: read LEFT column top-to-bottom, then RIGHT column.
-    #  This gives us the correct reading order.
-    # ================================================================== #
 
-    def _get_page_text(self, page) -> str:
-        """Single-column page: PyMuPDF handles reading order automatically."""
-        return page.get_text("text")
+@dataclass
+class HeadingAnchor:
+    line_idx: int
+    text: str
+    score: float
 
-    def _get_page_text_two_column(self, page) -> str:
-        """
-        Two-column page: manually sort blocks into left/right,
-        then read each column top-to-bottom.
-        b[0] = x position (left edge of block)
-        b[1] = y position (top edge of block) — used for sorting
-        b[4] = text content
-        """
-        blocks = [b for b in page.get_text("blocks") if b[6] == 0 and b[4].strip()]
-        mid_x  = page.rect.width / 2
 
-        left  = sorted([b for b in blocks if b[0] < mid_x],  key=lambda b: b[1])
-        right = sorted([b for b in blocks if b[0] >= mid_x], key=lambda b: b[1])
+# ─────────────────────────────────────────────────────────────────────
+#  TEXT UTILITIES
+# ─────────────────────────────────────────────────────────────────────
 
-        return "\n".join(b[4].strip() for b in left + right)
+def _normalize(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+    text = re.sub(r'[\ue000-\uf8ff]', '', text)
+    return text
 
-    def _get_full_text(self) -> str:
-        """Combine all pages into one big string."""
-        if self.pdf_type == "scanned":
-            return ""
-        elif self.pdf_type == "two_column":
-            return "\n".join(self._get_page_text_two_column(p) for p in self.doc)
-        else:
-            return "\n".join(self._get_page_text(p) for p in self.doc)
 
-    # ================================================================== #
-    #  Academic papers use many special characters:
-    #    - Greek letters: α, β, γ (used in math/statistics)
-    #    - Math symbols: ∑, ∇, ≤
-    #    - Ligatures: ﬁ (fi combined), ﬂ (fl combined)
-    #    - Dashes: em-dash (—), en-dash (–)
-    #
-    #  NFKC normalization:
-    #    - Converts ligatures to normal letters  (ﬁ → fi)
-    #    - Normalizes dashes and quotes to standard forms
-    #    - Handles compatibility characters
-    #
-    #  This runs ONCE right after extraction, before anything else.
-    # ================================================================== #
+def _clean_text(text: str, repeating: set) -> str:
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if len(s) <= 1:
+            out.append(line)
+            continue
+        if s in repeating:
+            continue
+        if re.search(r'\b\d{3,4}[–\-]\d{3,4}\b', s):
+            continue
+        if re.search(r'et al\.\s*\/', s, re.IGNORECASE):
+            continue
+        if re.fullmatch(r'(Page\s+)?\d{1,4}(\s+of\s+\d+)?', s, re.IGNORECASE):
+            continue
+        if re.fullmatch(r'https?://\S+', s):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
-    def _normalize_text(self, text: str) -> str:
-        """
-        Normalize unicode characters so downstream processing works cleanly.
-        NFKC = Normalization Form Compatibility Decomposition + Composition
-        """
-        # Step 1: NFKC normalization (handles ligatures, compatibility chars)
-        text = unicodedata.normalize("NFKC", text)
 
-        # Step 2: Remove control characters that sometimes sneak in from PDFs.
-        # We keep \n (newline=10) and \t (tab=9) because those are useful.
-        # Everything else below ASCII 32 is invisible garbage.
-        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+# ─────────────────────────────────────────────────────────────────────
+#  PAGE MODEL — structure-aware view over the PDF
+# ─────────────────────────────────────────────────────────────────────
 
-        # Step 3: Remove Private Use Area (PUA) characters.
-        # These are Unicode slots (\ue000 to \uf8ff) that fonts sometimes use
-        # for custom glyphs. In PDFs they often appear as random symbols or
-        # bullets that have no real meaning outside that font.
-        text = re.sub(r'[\ue000-\uf8ff]', '', text)
+class PageModel:
+    def __init__(self, doc):
+        self.doc = doc
+        self.lines: List[Line] = self._build_lines()
+        self.layout = self._detect_layout()
+        self.body_size = self._body_size()
+        self.repeating = self._repeating_lines()
 
-        return text
-
-    # ================================================================== 
-    #  Problem: Journal/conference papers repeat lines on every page:
-    #    "IEEE TRANSACTIONS ON NEURAL NETWORKS, VOL. 34, 2023"
-    #    "Authorized licensed use limited to: University of..."
-    #    "SMITH ET AL.: ATTENTION IS ALL YOU NEED"
-    #
-    #  These lines end up inside section content and corrupt everything.
-    #
-    #  Solution: Count how many DIFFERENT pages each line appears on.
-    #  If a line appears on 3+ different pages → it's a header/footer → remove it.
-    #
-    #  Why "3 or more"? A real sentence could appear twice (quote + reference),
-    #  but appearing on 3+ different pages is almost certainly boilerplate.
-    # ================================================================== #
-
-    def _detect_repeating_lines(self) -> set:
-        """
-        Returns a set of lines that appear on 3 or more different pages.
-        These are headers/footers/watermarks that should be removed.
-        """
-        # For each line, track which page numbers it appears on
-        # defaultdict(set) means: if key doesn't exist, create an empty set
-        line_page_map = defaultdict(set)
-
-        for page_num, page in enumerate(self.doc):
-            for line in page.get_text("text").split("\n"):
-                stripped = line.strip()
-                # Only track lines with real content (ignore blanks and single chars)
-                if len(stripped) > 5:
-                    line_page_map[stripped].add(page_num)
-
-        # Return only lines that appear on 3 or more different pages
-        repeating = {
-            line for line, pages in line_page_map.items()
-            if len(pages) >= 3
-        }
-
-        return repeating
-
-    # ================================================================== #
-    #  STEP 3 — CLEAN NOISE FROM TEXT
-    #  Removes:
-    #    - Page numbers ("1", "Page 3 of 10")
-    #    - Repeating headers/footers 
-    #    - Journal header lines with page ranges (e.g., "123-145")
-    #    - "et al. /" citation noise
-    #    - Standalone URLs
-    # ================================================================== #
-
-    def _clean_text(self, text: str, repeating_lines: set = None) -> str:
-        """
-        Clean noise from extracted text.
-        repeating_lines: the set returned by _detect_repeating_lines()
-        """
-        if repeating_lines is None:
-            repeating_lines = set()
-
-        lines   = text.split("\n")
-        cleaned = []
-
-        for line in lines:
-            s = line.strip()
-
-            # Keep blank lines (they help preserve paragraph structure)
-            if len(s) <= 1:
-                cleaned.append(line)
-                continue
-
-            # skip any line that's a repeating header/footer
-            if s in repeating_lines:
-                continue   
-
-            # Skip lines that look like page number ranges (e.g., "123-456")
-            if re.search(r'\b\d{3,4}[–\-]\d{3,4}\b', s):
-                continue
-
-            # Skip citation noise like "Smith et al. / Journal Name"
-            if re.search(r'et al\.\s*\/', s, re.IGNORECASE):
-                continue
-
-            # Skip standalone page numbers like "1", "42", "Page 3 of 10"
-            if re.fullmatch(r'(Page\s+)?\d{1,4}(\s+of\s+\d+)?', s, re.IGNORECASE):
-                continue
-
-            # Skip standalone URLs
-            if re.fullmatch(r'https?://\S+', s):
-                continue
-
-            cleaned.append(line)
-
-        return "\n".join(cleaned)
-
-    # ================================================================== #
-    #  STEP 4 — FONT SIZE DETECTION
-    #  We need to know the "normal" body text size so we can identify
-    #  text that's LARGER than normal (which is likely a heading).
-    #
-    #  How: collect ALL font sizes across ALL pages, find the most common one.
-    #  The most common font size = body text size (there's more body than headings).
-    # ================================================================== #
-
-    def _get_body_font_size(self) -> float:
-        """Returns the most common font size in the document = body text size."""
-        sizes = []
-        for page in self.doc:
-            # get_text("dict") gives us detailed info including font sizes
-            # We use this ONLY for font size detection, not for content
+    def _build_lines(self) -> List[Line]:
+        out: List[Line] = []
+        for pi, page in enumerate(self.doc):
+            pw, ph = page.rect.width, page.rect.height
             for block in page.get_text("dict").get("blocks", []):
-                for line in block.get("lines", []):
-                    for span in line.get("spans", []):
-                        sz = round(span.get("size", 0), 1)
-                        if sz > 0:
-                            sizes.append(sz)
+                if block.get("type", 0) != 0:
+                    continue
+                for ln in block.get("lines", []):
+                    spans = ln.get("spans", [])
+                    if not spans:
+                        continue
+                    text = "".join(s.get("text", "") for s in spans).strip()
+                    if not text:
+                        continue
+                    total = sum(len(s.get("text", "")) for s in spans) or 1
+                    size = sum(
+                        s.get("size", 0) * len(s.get("text", ""))
+                        for s in spans
+                    ) / total
+                    bold = any(s.get("flags", 0) & 16 for s in spans)
+                    bbox = ln.get("bbox", [0, 0, 0, 0])
+                    out.append(Line(
+                        text=text, page=pi,
+                        x0=bbox[0], y0=bbox[1], x1=bbox[2], y1=bbox[3],
+                        size=round(size, 2), bold=bold,
+                        page_width=pw, page_height=ph,
+                    ))
+        return out
 
+    def _detect_layout(self) -> str:
+        # Vote across first 5 pages — single page is too brittle.
+        n = min(5, len(self.doc))
+        if n == 0:
+            return "scanned"
+        votes = {"two_column": 0, "text": 0, "scanned": 0}
+        for pi in range(n):
+            page = self.doc[pi]
+            blocks = [b for b in page.get_text("blocks")
+                      if b[6] == 0 and b[4].strip()]
+            if not blocks:
+                votes["scanned"] += 1
+                continue
+            mid = page.rect.width * 0.45
+            left = [b for b in blocks if b[0] < mid]
+            right = [b for b in blocks if b[0] > mid]
+            if len(left) >= 3 and len(right) >= 3:
+                votes["two_column"] += 1
+            else:
+                votes["text"] += 1
+        if votes["scanned"] == n:
+            return "scanned"
+        return "two_column" if votes["two_column"] > votes["text"] else "text"
+
+    def _body_size(self) -> float:
+        sizes = [round(l.size, 1) for l in self.lines if len(l.text) > 20]
         if not sizes:
-            return 10.0   # fallback if we can't detect
-
-        # most_common(1) returns [(most_common_size, count)]
+            return 10.0
         return Counter(sizes).most_common(1)[0][0]
 
-    # ================================================================== #
-    #  STEP 4b — FONT-BASED HEADING DETECTION
-    #  This finds "custom" headings that aren't in KNOWN_HEADINGS.
-    #  Example: "Threat Model", "Dataset Description", "Ablation Study"
-    #
-    #  A line is a heading candidate if ANY of these is true:
-    #    - Font size > body size * 1.15  (it's noticeably larger)
-    #    - Font flags include bold (flags & 16)
-    #    - ALL CAPS and short (3-60 chars)
-    #    - Starts with a section number like "1." or "II."
-    #
-    # We now filter candidates more strictly:
-    #    - Must appear ≤ 2 times (headings don't repeat; body text might)
-    #    - Must not end with sentence punctuation (. , ; ?)
-    #    - Must not look like a figure/table caption
-    # ================================================================== #
+    def _repeating_lines(self) -> set:
+        # Compute on normalized text so matching survives _clean_text().
+        page_map: Dict[str, set] = defaultdict(set)
+        for l in self.lines:
+            t = _normalize(l.text).strip()
+            if len(t) > 5:
+                page_map[t].add(l.page)
+        return {t for t, pages in page_map.items() if len(pages) >= 3}
 
-    def _detect_headings(self, body_size: float, full_text: str) -> List[str]:
-        """
-        Returns a list of heading strings found via font analysis.
-        full_text is passed so we can filter out lines that repeat too much.
-        """
-        candidates = set()
-
-        for page in self.doc:
-            for block in page.get_text("dict").get("blocks", []):
-                for line in block.get("lines", []):
-                    # Build the line text from spans (for identification only)
-                    line_text = "".join(
-                        s.get("text", "") for s in line.get("spans", [])
-                    ).strip()
-
-                    # Skip: too short, too long, or empty
-                    if not line_text or len(line_text) > 100 or len(line_text) < 2:
-                        continue
-
-                    # Skip figure/table captions — these are not section headings
-                    if re.match(r'^(Fig(ure)?\.?|Table|Algorithm|Listing)\s*\d+', line_text, re.IGNORECASE):
-                        continue
-
-                    # Skip lines ending with sentence punctuation — headings don't end with . , ;
-                    if line_text[-1] in '.,:;?!':
-                        continue
-
-                    # Check font properties of spans in this line
-                    for span in line.get("spans", []):
-                        sz    = round(span.get("size", 0), 1)
-                        flags = span.get("flags", 0)
-
-                        is_larger   = sz > body_size * 1.15
-                        is_bold     = bool(flags & 16)
-                        is_caps     = line_text.isupper() and 3 < len(line_text) < 60
-                        is_numbered = bool(re.match(r'^(\d+\.?\d*|[IVX]+\.)\s+[A-Z]', line_text))
-
-                        if is_larger or is_bold or is_caps or is_numbered:
-                            candidates.add(line_text)
-                            break   # one span match per line is enough
-
-        # Filter: remove candidates that appear 3+ times in full text
-        # (real headings appear once; if it appears 3+ times it's probably body text)
-        filtered = [
-            h for h in candidates
-            if full_text.lower().count(h.lower()) <= 2
-        ]
-
-        return filtered
-
-    # ================================================================== #
-    #  STEP 5 — SECTION EXTRACTION
-    #
-    #   approach: split ONLY when heading is on its OWN LINE (anchored)
-    #
-    #  Two-tier strategy:
-    #    Tier 1 (PRIMARY): Split on KNOWN_HEADINGS with line anchoring
-    #    Tier 2 (SUPPLEMENT): Add font-detected custom headings
-    #
-    #  We prefer known headings as primary because they're the most reliable.
-    # ================================================================== #
-
-    def _extract_structured_sections(self, clean_text: str) -> List[PaperSection]:
-        """
-        Main section extraction. Tries known headings first, then supplements
-        with font-detected headings for papers with custom section names.
-        """
-        body_size = self._get_body_font_size()
-
-        # Tier 1: Try splitting on known headings (most reliable)
-        sections = self._split_by_known_headings(clean_text)
-
-        # If we got meaningful sections, we're done
-        if len(sections) > 2:
-            return sections
-
-        # Tier 2: Known headings didn't work well — try font-detected headings
-        # (handles papers with unusual section names)
-        font_headings = self._detect_headings(body_size, clean_text)
-        if font_headings:
-            sections = self._split_by_headings(clean_text, font_headings)
-            if len(sections) > 1:
-                return sections
-
-        # Last resort: regex fallback on known heading names
-        return self._regex_fallback_sections(clean_text)
-
-    def _split_by_known_headings(self, clean_text: str) -> List[PaperSection]:
-        """
-        The key pattern is:  (?m)^\s*(optional_number + heading_name)\s*$
-
-        Breaking that down:
-          (?m)   = multiline mode — ^ and $ match start/end of each LINE
-          ^      = start of a line
-          \s*    = optional leading whitespace (indented headings)
-          (?:...) = the heading text (with optional number prefix)
-          \s*$   = optional trailing whitespace, then END of line
-
-        The $ at the end is THE MOST IMPORTANT PART.
-        Without it, "introduction" would match inside sentences like
-        "This introduces a new method" → causing false splits.
-        With $ it only matches when "introduction" is the ENTIRE line.
-        """
-        # Build a pattern that matches any known heading on its own line
-        # Optional prefix: "1.", "1.1", "I.", "II." etc.
-        number_prefix = r'(?:\d+\.?\d*\s+|[IVX]+\.\s+)?'
-
-        # Join all known headings with | (OR)
-        headings_pattern = '|'.join(re.escape(h) for h in KNOWN_HEADINGS)
-
-        # Full pattern: start-of-line, optional number, heading word, end-of-line
-        pattern = rf'(?m)^\s*({number_prefix}(?:{headings_pattern}))\s*$'
-
-        parts = re.split(pattern, clean_text, flags=re.IGNORECASE)
-
-        return self._build_sections_from_parts(parts)
-
-    def _split_by_headings(
-        self, clean_text: str, headings: List[str]
-    ) -> List[PaperSection]:
-        """
-         for font-detected headings.
-        Same line-anchoring approach — heading must be the ENTIRE line.
-        """
-        if not headings:
-            return []
-
-        escaped = [re.escape(h) for h in headings]
-        # (?m)^ = line start,  \s*$ = end of line — heading must be alone on line
-        pattern = r'(?m)^\s*(' + '|'.join(escaped) + r')\s*$'
-
-        parts = re.split(pattern, clean_text, flags=re.IGNORECASE)
-
-        return self._build_sections_from_parts(parts)
-
-    def _build_sections_from_parts(self, parts: List[str]) -> List[PaperSection]:
-        """
-        Helper: converts the output of re.split into PaperSection objects.
-
-        re.split with a capture group returns:
-          [before_first_match, match1, content1, match2, content2, ...]
-
-        So parts[0] = text before first heading (title/abstract area)
-        Then alternating: heading text, content, heading text, content...
-        """
-        sections: List[PaperSection] = []
-
-        # Text before the first heading (usually title + authors + abstract)
-        if parts[0].strip():
-            sections.append(PaperSection(
-                section_name="Header/Metadata",
-                content=parts[0].strip(),
-            ))
-
-        # Walk through heading + content pairs
-        for i in range(1, len(parts), 2):
-            header  = parts[i].strip()
-            content = parts[i + 1].strip() if (i + 1) < len(parts) else ""
-
-            # Skip sections with very little content (likely a false split)
-            if content and len(content) > 30:
-                sections.append(PaperSection(
-                    section_name=header,
-                    content=content,
-                ))
-
-        return sections
-
-    def _regex_fallback_sections(self, clean_text: str) -> List[PaperSection]:
-        """
-        Last resort: simple regex on known heading names.
-        Less strict than _split_by_known_headings but catches papers
-        where headings aren't perfectly on their own line.
-        """
-        pattern = "|".join([f"^{re.escape(h)}" for h in KNOWN_HEADINGS])
-        parts   = re.split(
-            f"({pattern})", clean_text,
-            flags=re.MULTILINE | re.IGNORECASE
-        )
-        return self._build_sections_from_parts(parts)
-
-    # ================================================================== #
-    #  STEP 6 — METADATA EXTRACTION
-    #  Extracts: title, authors, year, venue, keywords
-    #
-    #  Four layers in order:
-    #    Layer 1: PDF built-in metadata (most reliable when present)
-    #    Layer 2: Font-based title detection (largest text on page 1)
-    #    Layer 3: Positional author detection (between title and Abstract)
-    #    Layer 4: Regex on first 3000 chars for year/venue/keywords
-    # ================================================================== #
-
-    def _extract_title_from_fonts(self) -> Optional[str]:
-        """
-        Find the title = the largest text on the first page.
-
-        Improvements over original:
-        - Score by font size AND length (prefer 15-150 chars)
-        - Skip ALL-CAPS short lines (usually journal name banners)
-        - Skip lines with volume/issue/DOI patterns
-        """
-        if not self.doc:
-            return None
-
-        page        = self.doc[0]
-        best_text   = ""
-        best_score  = 0.0
-
-        for block in page.get_text("dict").get("blocks", []):
-            for line in block.get("lines", []):
-                line_text = "".join(
-                    s.get("text", "") for s in line.get("spans", [])
-                ).strip()
-
-                # Skip too short or too long
-                if len(line_text) < 10 or len(line_text) > 200:
-                    continue
-
-                # Skip journal banners like "IEEE TRANSACTIONS ON ..." (all caps, short)
-                if line_text.isupper() and len(line_text) < 80:
-                    continue
-
-                # Skip lines with DOI, volume, issue numbers
-                if re.search(r'(doi|vol\.|volume|issue|pp\.|pages|\bno\b)', line_text, re.IGNORECASE):
-                    continue
-
-                spans    = line.get("spans", [])
-                avg_size = sum(s.get("size", 0) for s in spans) / max(len(spans), 1)
-
-                # Score = font size (bigger is better for title)
-                # We keep it simple — just use font size as the score
-                if avg_size > best_score:
-                    best_score = avg_size
-                    best_text  = line_text
-
-        return best_text or None
-
-    def _extract_authors_from_fonts(self, title: Optional[str], body_size: float) -> List[str]:
-        """
-        Extract authors using POSITIONAL logic:
-        Authors appear BETWEEN the title and the Abstract/Introduction.
-
-        Strategy:
-        1. Find where the title ends (by matching title text)
-        2. Find where the abstract starts (by looking for "Abstract" heading)
-        3. Scan lines in between — name-like lines = authors
-
-        A line looks like a name if:
-        - 1 to 6 words
-        - Each word starts with a capital letter
-        - No digits, @ symbols, or institution keywords
-        """
-        if not self.doc:
-            return []
-
-        page       = self.doc[0]
-        page_text  = page.get_text("text")
-        lines      = [l.strip() for l in page_text.split("\n") if l.strip()]
-
-        # Find title position in lines
-        title_idx    = -1
-        abstract_idx = len(lines)   # default: scan until end if no abstract found
-
-        if title:
-            for i, line in enumerate(lines):
-                if title.lower()[:30] in line.lower():
-                    title_idx = i
-                    break
-
-        # Find where "Abstract" appears
-        for i, line in enumerate(lines):
-            if re.match(r'^\s*abstract\s*$', line, re.IGNORECASE):
-                abstract_idx = i
-                break
-
-        # The author zone is between title and abstract
-        # If we couldn't find title, scan first 15 lines
-        start = max(title_idx + 1, 0)
-        end   = min(abstract_idx, start + 15)   # don't scan too far
-        zone  = lines[start:end]
-
-        authors = []
-        for line in zone:
-            # Skip institution/affiliation lines
-            if re.search(
-                r'university|institute|department|college|school|laboratory|'
-                r'lab\b|center|centre|faculty|@|\.com|\.edu|\.org|\d{4,5}',
-                line, re.IGNORECASE
-            ):
+    def column_aware_text(self) -> str:
+        if self.layout != "two_column":
+            return "\n".join(l.text for l in self.lines)
+        out: List[str] = []
+        for pi in range(len(self.doc)):
+            page_lines = [l for l in self.lines if l.page == pi]
+            if not page_lines:
                 continue
+            mid = page_lines[0].page_width / 2
+            left = sorted([l for l in page_lines if l.x0 < mid],
+                          key=lambda l: l.y0)
+            right = sorted([l for l in page_lines if l.x0 >= mid],
+                           key=lambda l: l.y0)
+            out.extend(l.text for l in left)
+            out.extend(l.text for l in right)
+        return "\n".join(out)
 
-            # Skip lines that are clearly not names (too long, or look like sentences)
-            if len(line) > 100 or len(line) < 3:
-                continue
 
-            # Skip if it's (part of) the title
-            if title and line.lower() in title.lower():
-                continue
+# ─────────────────────────────────────────────────────────────────────
+#  VALIDATORS
+# ─────────────────────────────────────────────────────────────────────
 
-            # A name: 1-6 words, starts with capital, no unusual punctuation
-            words = line.split()
-            if 1 <= len(words) <= 6:
-                # Every word should start with a capital letter (names do)
-                all_capitalized = all(w[0].isupper() for w in words if w.isalpha())
-                if all_capitalized:
-                    authors.append(line)
+def _validate_title(t: Optional[str]) -> bool:
+    if not t:
+        return False
+    t = t.strip()
+    if len(t) < 10 or len(t) > 250:
+        return False
+    if t.lower().startswith("microsoft word"):
+        return False
+    if re.fullmatch(r'https?://\S+', t):
+        return False
+    # Reject venue/journal banners — these sit at the very top of page 1
+    # in a large font and otherwise win the title-scoring contest.
+    # Use match (anchored) so a real title that *mentions* a journal mid-string survives.
+    if re.match(rf'^\s*{VENUE_TOKENS}', t, re.IGNORECASE):
+        return False
+    if re.search(r'\bISSN\b|\bDOI\b|\bvol\.?\s*\d', t, re.IGNORECASE):
+        return False
+    return True
 
-        if not authors:
-            return []
 
-        # If multiple lines were collected, they might be:
-        #   A) One author per line → ["Alice Smith", "Bob Jones"] → return as-is
-        #   B) All authors on one line → "Alice Smith, Bob Jones" → split by comma
+def _validate_author(name: str) -> bool:
+    if not name:
+        return False
+    name = name.strip()
+    if len(name) < 3 or len(name) > 80:
+        return False
+    if name.lower() in JUNK_AUTHOR_TOKENS:
+        return False
+    if re.search(r'\d{3,}', name):
+        return False
+    if AFFIL_RE.search(name):
+        return False
+    if not re.search(r'[A-Za-z]', name):
+        return False
+    # A real name has a separator (space / hyphen / dot). Single-token
+    # strings like "hp" or "admin" are almost always metadata junk.
+    if not re.search(r'[\s\-\.]', name):
+        return False
+    return True
 
-        # Check if any single line contains commas (all-on-one-line format)
-        combined = []
-        for line in authors[:5]:   # limit to first 5 candidate lines
-            if ',' in line or ' and ' in line.lower():
-                # Split this line by comma/and
-                parts = re.split(r'[,;]|\band\b', line)
-                combined.extend([p.strip() for p in parts if p.strip() and len(p.strip()) > 2])
+
+def _validate_year(y: Any) -> bool:
+    try:
+        y = int(y)
+    except Exception:
+        return False
+    return YEAR_MIN <= y <= YEAR_MAX
+
+
+def _validate_abstract(t: Optional[str]) -> bool:
+    if not t:
+        return False
+    t = t.strip()
+    if len(t) < 100 or len(t) > 4000:
+        return False
+    if t.count('.') < 2:
+        return False
+    return True
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  HEADING SCORER
+# ─────────────────────────────────────────────────────────────────────
+
+def _heading_score(line: Line, body_size: float, full_text_lower: str) -> float:
+    t = line.text.strip()
+    if not t or len(t) > 120 or len(t) < 2:
+        return 0.0
+    if re.match(r'^(Fig(ure)?\.?|Table|Algorithm|Listing)\s*\d+',
+                t, re.IGNORECASE):
+        return 0.0
+
+    t_low = t.lower()
+    stripped = re.sub(
+        r'^(\d+(\.\d+)*\.?|[IVX]+\.|[A-Z]\.)\s+', '', t_low
+    ).strip().rstrip(':')
+
+    # Hard override — clean known heading standing alone.
+    if (stripped in KNOWN_HEADINGS_SET or t_low in KNOWN_HEADINGS_SET) \
+            and len(t) < 100:
+        return 0.9
+
+    size_ratio = line.size / body_size if body_size else 1.0
+    size_s = max(0.0, min(1.0, (size_ratio - 1.0) / 0.5))
+    bold_s = 1.0 if line.bold else 0.0
+    numbered = bool(re.match(
+        r'^(\d+(\.\d+)*\.?|[IVX]+\.|[A-Z]\.)\s+\S', t
+    ))
+    num_s = 1.0 if numbered else 0.0
+    short_s = 1.0 if len(t) < 60 else 0.5 if len(t) < 100 else 0.0
+    caps_s = 1.0 if (t.isupper() and 3 < len(t) < 80) else 0.0
+
+    penalty = 0.0
+    if t[-1] in '.,;?!' and not numbered:
+        penalty += 0.4
+    if full_text_lower.count(t_low) > 3:
+        penalty += 0.3
+
+    score = (0.30 * size_s + 0.20 * bold_s + 0.20 * num_s
+             + 0.15 * short_s + 0.15 * caps_s - penalty)
+    return max(0.0, min(1.0, score))
+
+
+def _detect_anchors(pm: PageModel) -> List[HeadingAnchor]:
+    full_lower = "\n".join(l.text for l in pm.lines).lower()
+    anchors: List[HeadingAnchor] = []
+    for i, l in enumerate(pm.lines):
+        s = _heading_score(l, pm.body_size, full_lower)
+        if s >= HEADING_ACCEPT_THRESHOLD:
+            anchors.append(HeadingAnchor(i, l.text.strip(), s))
+    return anchors
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  SECTION SPLIT
+# ─────────────────────────────────────────────────────────────────────
+
+# Author-bio / contact-info markers that often appear at the end of a paper
+# without a proper heading — they bleed into the last real section.
+AUTHOR_BIO_MARKERS = re.compile(
+    r'(?im)^\s*('
+    r'mailing\s+address|e-?mail\s*:|'
+    r'orcid\s*(id)?\s*:?\s*https?|orcid\.org/|'
+    r'\bmobile\s*:|\btel(?:\.|ephone)?\s*:|\bphone\s*:|\bfax\s*:|'
+    r'about\s+the\s+authors?|author\s+biograph(?:y|ies)|biograph(?:y|ies)\s+of\s+author|'
+    r'corresponding\s+author\s*:'
+    r')'
+)
+
+
+def _trim_author_bio(text: str) -> str:
+    """Cuts a trailing author-bio block off a section's content."""
+    if not text:
+        return text
+    m = AUTHOR_BIO_MARKERS.search(text)
+    if not m:
+        return text
+    # Only trim if the bio block is in the latter half — a contact mention
+    # mid-paper (e.g., a corresponding-author footnote on page 1) should stay.
+    if m.start() < len(text) * 0.4:
+        return text
+    return text[:m.start()].rstrip()
+
+
+def _split_sections(pm: PageModel, anchors: List[HeadingAnchor],
+                    clean_text: str) -> List[PaperSection]:
+    if not anchors:
+        return _regex_section_fallback(clean_text)
+
+    out: List[PaperSection] = []
+    first = anchors[0].line_idx
+    header_txt = "\n".join(l.text for l in pm.lines[:first]).strip()
+    if header_txt:
+        out.append(PaperSection(
+            section_name="Header/Metadata", content=header_txt,
+        ))
+
+    for i, a in enumerate(anchors):
+        start = a.line_idx + 1
+        end = anchors[i + 1].line_idx if i + 1 < len(anchors) else len(pm.lines)
+        body = "\n".join(l.text for l in pm.lines[start:end]).strip()
+        # Trim trailing author-bio block from the LAST section only.
+        if i + 1 == len(anchors):
+            body = _trim_author_bio(body)
+        if len(body) >= 30:
+            out.append(PaperSection(section_name=a.text, content=body))
+    return out
+
+
+def _regex_section_fallback(clean_text: str) -> List[PaperSection]:
+    pattern = '|'.join(re.escape(h) for h in KNOWN_HEADINGS)
+    parts = re.split(
+        rf'(?im)^\s*((?:\d+\.?\d*\s+|[IVX]+\.\s+)?(?:{pattern}))\s*:?\s*$',
+        clean_text,
+    )
+    sections: List[PaperSection] = []
+    if parts and parts[0].strip():
+        sections.append(PaperSection(
+            section_name="Header/Metadata", content=parts[0].strip(),
+        ))
+    last_idx = max((i for i in range(1, len(parts), 2)), default=-1)
+    for i in range(1, len(parts), 2):
+        name = parts[i].strip()
+        content = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        if i == last_idx:
+            content = _trim_author_bio(content)
+        if len(content) > 30:
+            sections.append(PaperSection(section_name=name, content=content))
+    return sections
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  TITLE EXTRACTOR
+# ─────────────────────────────────────────────────────────────────────
+
+def _score_title(text: str, size: float, body_size: float,
+                 y0: float, ph: float) -> float:
+    if not text:
+        return 0.0
+    len_s = 1.0 if 15 <= len(text) <= 200 else 0.3
+    size_s = max(0.0, min(1.0,
+                 (size / body_size - 1.0) / 0.8 if body_size else 0.5))
+    top_s = 1.0 - min(y0 / (ph * 0.4), 1.0)
+    bad = bool(re.search(
+        r'(doi|vol\.|volume|issue|pp\.|\bno\b|©|copyright|\bissn\b)',
+        text, re.IGNORECASE,
+    )) or text.lower().startswith("microsoft word") \
+       or bool(re.match(rf'^\s*{VENUE_TOKENS}', text, re.IGNORECASE))
+    clean_s = 0.0 if bad else 1.0
+    return max(0.0, min(1.0,
+               0.35 * size_s + 0.25 * len_s + 0.20 * top_s + 0.20 * clean_s))
+
+
+def extract_title(pm: PageModel, pdf_meta_title: Optional[str]) -> Extracted:
+    if pdf_meta_title and _validate_title(pdf_meta_title):
+        return Extracted(pdf_meta_title.strip(), 0.9, "pdf_meta")
+
+    p0 = sorted([l for l in pm.lines if l.page == 0], key=lambda l: l.y0)
+    if not p0:
+        return Extracted(None, 0.0, "none")
+
+    ph = p0[0].page_height
+    max_size = max(l.size for l in p0)
+
+    # Group adjacent lines of near-equal size in the top region.
+    groups: List[List[Line]] = []
+    current: List[Line] = []
+    prev_size: Optional[float] = None
+    for l in p0:
+        if l.y0 > ph * 0.45:
+            break
+        if l.size >= max_size * 0.9:
+            if prev_size is None or abs(l.size - prev_size) < 0.5:
+                current.append(l)
             else:
-                combined.append(line)
+                if current:
+                    groups.append(current)
+                current = [l]
+            prev_size = l.size
+        else:
+            if current:
+                groups.append(current)
+            current = []
+            prev_size = None
+    if current:
+        groups.append(current)
 
-        return combined[:10]   # return at most 10 authors
+    best_text, best_score = None, 0.0
+    for g in groups:
+        text = " ".join(l.text for l in g).strip()
+        s = _score_title(text, g[0].size, pm.body_size, g[0].y0, ph)
+        if s > best_score:
+            best_score, best_text = s, text
 
-    def extract_metadata(self, clean_text: str) -> Dict:
-        """
-        Extract paper metadata in layers.
-        Each layer fills in only what the previous layer missed.
-        """
-        body_size = self._get_body_font_size()
+    if best_text and _validate_title(best_text):
+        return Extracted(best_text, best_score, "font_score")
+    return Extracted(None, 0.0, "none")
 
-        # ── Layer 1: PDF built-in metadata ──────────────────────────────
-        # PDFs sometimes store title/author in their metadata fields.
-        # This is the most reliable source when available.
-        meta        = self.doc.metadata
-        title       = meta.get("title", "").strip() or None
-        raw_authors = meta.get("author", "").strip()
-        authors     = (
-            [a.strip() for a in re.split(r"[;,]", raw_authors) if a.strip()]
-            if raw_authors else []
-        )
 
-        # ── Layer 2: Font-based title ────────────────────────────────────
-        if not title:
-            title = self._extract_title_from_fonts()
+# ─────────────────────────────────────────────────────────────────────
+#  AUTHOR EXTRACTOR
+# ─────────────────────────────────────────────────────────────────────
 
-        # ── Layer 3: Positional author extraction ────────────────────────
-        if not authors:
-            authors = self._extract_authors_from_fonts(title, body_size)
+def _score_author_line(text: str) -> float:
+    if len(text) < 3 or len(text) > 250:
+        return 0.0
+    if AFFIL_RE.search(text):
+        return 0.0
+    if not re.search(r'[A-Z]', text):
+        return 0.0
+    tokens = [t.strip() for t in
+              re.split(r'[,;]|\band\b|&|\s+', text, flags=re.IGNORECASE)
+              if t.strip()]
+    if not tokens:
+        return 0.0
+    name_like = sum(
+        1 for t in tokens
+        if re.match(r"^[A-Z][A-Za-z\.\-'’]{0,30}$", t)
+        or re.match(r"^[a-z]{2,3}$", t)   # particles: de, van, der
+    )
+    ratio = name_like / len(tokens)
+    digit_pen = 0.3 if re.search(r'\b\d{3,}\b', text) else 0.0
+    return max(0.0, min(1.0, ratio - digit_pen))
 
-        # ── Layer 4: Regex on first 3000 characters ──────────────────────
-        head = clean_text[:3000]
 
-        # Year: find first 4-digit year like 2019, 2023
-        year = None
-        m    = re.search(r'\b(19|20)\d{2}\b', head)
-        if m:
-            year = int(m.group())
+def extract_authors(pm: PageModel, title_text: Optional[str],
+                    pdf_meta_authors: Optional[str]) -> Extracted:
+    if pdf_meta_authors:
+        raw = [a.strip() for a in re.split(r'[;,]', pdf_meta_authors)
+               if a.strip()]
+        clean = [a for a in raw if _validate_author(a)]
+        # Trust PDF metadata only when it looks like multiple real names
+        # OR a single multi-word name. Single tokens like "hp" slip past
+        # otherwise — they're OS usernames, not authors.
+        if len(clean) >= 2 or (clean and ' ' in clean[0]):
+            return Extracted(clean, 0.85, "pdf_meta")
 
-        # Venue: look for publisher/conference names
-        venue = None
-        m = re.search(
-            r'(Proceedings of|Journal of|Conference on|Workshop on|'
-            r'arXiv:\d{4}\.\d{4,5}|IEEE|ACM|ICML|NeurIPS|CVPR|ACL|'
-            r'EMNLP|ICLR|Springer|Elsevier|Nature|Science|PLOS)'
-            r'[^,\n]{0,60}',         # stop at comma or newline, max 60 chars
-            head, re.IGNORECASE
-        )
-        if m:
-            venue = m.group().strip().rstrip('.:;')   # clean trailing punctuation
+    p0 = sorted([l for l in pm.lines if l.page == 0], key=lambda l: l.y0)
+    if not p0:
+        return Extracted([], 0.0, "none")
 
-        # Keywords: look for "Keywords: word1, word2, ..."
-        keywords: List[str] = []
-        m = re.search(r'[Kk]ey\s*[Ww]ords?\s*[:\-—]?\s*(.+)', head)
-        if m:
-            keywords = [
-                k.strip() for k in re.split(r'[;,·•–]', m.group(1))
-                if k.strip()
-            ]
+    title_end = -1
+    if title_text:
+        probe = title_text.lower()[:40]
+        for i, l in enumerate(p0):
+            lt = l.text.lower()
+            if probe and (probe in lt or lt[:40] in title_text.lower()):
+                title_end = i
+    abstract_idx = len(p0)
+    for i, l in enumerate(p0):
+        if re.match(r'^\s*(abstract|summary)\b', l.text, re.IGNORECASE):
+            abstract_idx = i
+            break
 
-        return {
-            "title":    title,
-            "authors":  authors,
-            "year":     year,
-            "venue":    venue,
-            "keywords": keywords,
-        }
+    zone = p0[title_end + 1:abstract_idx]
 
-    # ================================================================== #
-    #  STEP 7 — REFERENCE EXTRACTION
-    #  References are in their own section, so we first find that section,
-    #  then try to split it into individual references.
-    #
-    #  Two strategies:
-    #    Strategy 1: Regex patterns for known citation styles
-    #    Strategy 2: Line accumulator (builds multi-line references)
-    # ================================================================== #
+    names: List[str] = []
+    matched_any = False
+    for l in zone:
+        s = _score_author_line(l.text)
+        if s < 0.4:
+            continue
+        matched_any = True
+        parts = re.split(r',|;|\band\b|&', l.text, flags=re.IGNORECASE)
+        for p in parts:
+            p = re.sub(r'\d+[\*†‡§¶]*|[\*†‡§¶]', '', p).strip()
+            if _validate_author(p):
+                names.append(p)
 
-    def extract_references(self, sections: List[PaperSection]) -> Tuple[List[str], str]:
-        """
-        Find the references section and extract individual references from it.
-        Returns (list_of_references, raw_text).
-        """
-        raw_text = ""
+    names = list(dict.fromkeys(names))[:12]
+    if names:
+        return Extracted(names, 0.7, "font_score")
+    return Extracted([], 0.2 if matched_any else 0.0, "none")
 
-        # Find the references/bibliography section
-        # We check for multiple names because papers use different terms
-        for section in sections:
-            name_lower = section.section_name.lower()
-            if any(word in name_lower for word in ["reference", "bibliography", "works cited"]):
-                raw_text = section.content
-                break
 
-        if not raw_text:
-            return [], ""
+# ─────────────────────────────────────────────────────────────────────
+#  YEAR, VENUE, KEYWORDS, ABSTRACT
+# ─────────────────────────────────────────────────────────────────────
 
-        # ── Strategy 1: Try each regex pattern ──────────────────────────
-        # Compile all patterns so we can also use them in Strategy 2
-        compiled_patterns = [re.compile(p, re.MULTILINE) for p in REFERENCE_PATTERNS]
+def extract_year(head_text: str) -> Extracted:
+    candidates = []
+    for m in re.finditer(r'\b(19|20)\d{2}\b', head_text):
+        y = int(m.group())
+        if not _validate_year(y):
+            continue
 
-        for pattern in compiled_patterns:
-            matches = pattern.findall(raw_text)
-            if len(matches) >= 2:
-                # Found a pattern that works — use it
-                return [m.strip() for m in matches if m.strip()], raw_text
+        before = head_text[max(0, m.start() - 40):m.start()].lower()
+        after = head_text[m.end():m.end() + 40].lower()
+        ctx = before + " " + after
 
-        # ── Strategy 2: Line accumulator ────────────────────────────────
-        # For formats where each reference spans multiple lines.
-        # We detect the START of a new reference, then collect lines
-        # until the next reference starts.
-        lines       = [l.strip() for l in raw_text.split("\n") if l.strip()]
-        parsed_refs = []
-        current_ref = ""
+        # Hard reject — manuscript / copyright / license context.
+        if re.search(
+            r'(received|accepted|submitted|revised|'
+            r'©|\(c\)|copyright|doi\s*[:/]|'
+            r'volume|vol\.|issue|pp\.|pages?\s+\d|'
+            r'licen[cs]e|correspondence)', ctx,
+        ):
+            continue
 
-        for line in lines:
-            # Check if this line looks like the START of a new reference
-            # using any of our compiled patterns
-            is_new_ref = any(p.match(line) for p in compiled_patterns)
+        # Positive signals raise score: venue token nearby is strongest.
+        score = 0.55
+        window = head_text[max(0, m.start() - 200):m.end() + 200]
+        if re.search(VENUE_TOKENS, window, re.IGNORECASE):
+            score = 0.85
+        if re.search(
+            r'(published|proceedings|conference|workshop)', ctx,
+        ):
+            score = max(score, 0.80)
 
-            # Also catch simple patterns: [1], 1. etc.
-            if not is_new_ref:
-                is_new_ref = bool(re.match(r'^(\[\d+\]|\d+[\.\)])', line))
+        candidates.append((y, score, m.start()))
 
-            if is_new_ref and current_ref:
-                # Save the previous reference (if it has enough content)
-                if len(current_ref) > 20:
-                    parsed_refs.append(current_ref.strip())
-                current_ref = line
-            elif is_new_ref:
-                # First reference found
-                current_ref = line
-            elif current_ref and len(line) > 10:
-                # Continue building the current reference
-                current_ref += " " + line
+    if not candidates:
+        return Extracted(None, 0.0, "none")
 
-        # Don't forget the last reference
-        if current_ref and len(current_ref) > 20:
-            parsed_refs.append(current_ref.strip())
+    # Highest score wins; ties → latest year (pub ≥ received).
+    candidates.sort(key=lambda c: (-c[1], -c[0]))
+    y, score, _ = candidates[0]
+    return Extracted(y, score, "regex")
 
-        return parsed_refs, raw_text
 
-    # ================================================================== #
-    #  STEP 8 — LLM METADATA FALLBACK
-    #  If title or authors are still missing after all the above steps,
-    #  we ask the LLM to extract them from the first page text.
-    #  This is the last resort — it's slower but more flexible.
-    # ================================================================== #
+def extract_venue(head_text: str) -> Extracted:
+    m = re.search(VENUE_TOKENS + r'[^,\n]{0,80}', head_text, re.IGNORECASE)
+    if m:
+        v = m.group().strip().rstrip('.,:;')
+        if 3 <= len(v) <= 120:
+            return Extracted(v, 0.7, "regex")
+    return Extracted(None, 0.0, "none")
 
-    def _llm_metadata_fallback(self, meta: dict, first_page_text: str, llm) -> dict:
-        """Ask the LLM to extract missing metadata from first page text."""
-        try:
-            prompt = f"""Extract metadata from this research paper's first page.
-Return ONLY valid JSON. No explanation. No markdown fences.
+
+def extract_keywords(head: str) -> List[str]:
+    m = re.search(
+        r'(?:[Kk]ey\s*[Ww]ords?|Index\s+Terms)\s*[:\-—]?\s*(.+)', head,
+    )
+    if not m:
+        return []
+    return [k.strip() for k in re.split(r'[;,·•–]', m.group(1))
+            if k.strip()][:15]
+
+
+def extract_abstract(pm: PageModel, sections: List[PaperSection],
+                     clean_text: str) -> Extracted:
+    for s in sections:
+        if "abstract" in s.section_name.lower():
+            content = s.content.strip()
+            # Oversized section means the next heading anchor was missed —
+            # abstract grabbed everything until the next detected heading.
+            # Clip to the first paragraph boundary or first sentence block.
+            if len(content) > 3500:
+                m = re.search(r'^(.{200,3500}?)\n\s*\n', content, re.DOTALL)
+                if m:
+                    content = m.group(1).strip()
+                else:
+                    content = content[:2000].rsplit('.', 1)[0] + '.'
+            if _validate_abstract(content):
+                return Extracted(content, 0.80, "section_split")
+
+    p0_text = _normalize("\n".join(
+        l.text for l in pm.lines if l.page == 0
+    ))
+    m = re.search(
+        r'(?is)\babstract\b[:.\s—\-]+(.{200,3500}?)'
+        r'(?=\n\s*(?:keywords?\b|index\s+terms|'
+        r'1\.?\s+introduction|i\.\s+introduction|\n\s*introduction\b))',
+        p0_text,
+    )
+    if m and _validate_abstract(m.group(1)):
+        return Extracted(m.group(1).strip(), 0.65, "inline_regex")
+
+    for s in sections:
+        if s.section_name.lower().startswith("header"):
+            m = re.search(
+                r'(?is)\babstract\b[:.\s—\-]+(.{200,3500})', s.content,
+            )
+            if m and _validate_abstract(m.group(1)):
+                return Extracted(m.group(1).strip(), 0.55, "inline_regex")
+
+    head = clean_text[:600].strip()
+    return Extracted(head, 0.2, "truncate")
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  REFERENCES
+# ─────────────────────────────────────────────────────────────────────
+
+def extract_references(sections: List[PaperSection]) -> Tuple[List[str], str]:
+    raw = ""
+    for s in sections:
+        n = s.section_name.lower()
+        if any(w in n for w in ("reference", "bibliography", "works cited")):
+            raw = s.content
+            break
+    if not raw:
+        return [], ""
+
+    compiled = [re.compile(p, re.MULTILINE) for p in REFERENCE_PATTERNS]
+    for pat in compiled:
+        matches = pat.findall(raw)
+        if len(matches) >= 2:
+            return [m.strip() for m in matches if m.strip()], raw
+
+    lines = [l.strip() for l in raw.split("\n") if l.strip()]
+    refs: List[str] = []
+    current = ""
+    for line in lines:
+        is_new = any(p.match(line) for p in compiled) \
+                 or bool(re.match(r'^(\[\d+\]|\d+[\.\)])', line))
+        if is_new and current:
+            if len(current) > 20:
+                refs.append(current.strip())
+            current = line
+        elif is_new:
+            current = line
+        elif current and len(line) > 10:
+            current += " " + line
+    if current and len(current) > 20:
+        refs.append(current.strip())
+    return refs, raw
+
+
+# ─────────────────────────────────────────────────────────────────────
+#  LLM REFINER — batched, confidence-triggered
+# ─────────────────────────────────────────────────────────────────────
+
+def llm_refine(fields: Dict[str, Extracted], first_page: str, llm,
+               threshold: float = 0.6) -> Dict[str, Extracted]:
+    needs = [k for k, ex in fields.items() if ex.confidence < threshold]
+    if not needs or llm is None:
+        return fields
+
+    try:
+        keys_block = "\n".join(f'  "{k}": null,' for k in needs).rstrip(",")
+        prompt = f"""Extract these fields from the paper first page.
+Return ONLY valid JSON. No markdown. Use null if unknown.
 
 {{
-  "title": "string or null",
-  "authors": ["list", "of", "author", "names"],
-  "year": 2024,
-  "venue": "string or null"
+{keys_block}
 }}
 
+For "authors" return a list of names. For "year" return an integer.
+
 TEXT:
-{first_page_text[:2000]}
+{first_page[:2500]}
 
 JSON:"""
-            response = llm.invoke(prompt)
-            raw      = response.content.strip()
+        resp = llm.invoke(prompt)
+        raw = resp.content.strip()
+        raw = re.sub(r'^```json\s*|```$', '', raw,
+                     flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
 
-            # Remove markdown code fences if LLM adds them despite instructions
-            raw = re.sub(r'^```json\s*|```$', '', raw, flags=re.MULTILINE).strip()
+        for k in needs:
+            v = parsed.get(k)
+            if v in (None, "", []):
+                continue
+            if k == "title" and isinstance(v, str) and _validate_title(v):
+                fields[k] = Extracted(v.strip(), 0.75, "llm")
+            elif k == "authors" and isinstance(v, list):
+                clean = [a.strip() for a in v
+                         if isinstance(a, str) and _validate_author(a)]
+                if clean:
+                    fields[k] = Extracted(clean, 0.75, "llm")
+            elif k == "year" and _validate_year(v):
+                fields[k] = Extracted(int(v), 0.75, "llm")
+            elif k == "venue" and isinstance(v, str) and 3 <= len(v) <= 120:
+                fields[k] = Extracted(v.strip(), 0.7, "llm")
+    except Exception as e:
+        # Don't crash parsing on a bad LLM response, but make the failure
+        # visible so a silent rate-limit or JSON parse error can be diagnosed.
+        print(f"[parser.llm_refine] LLM refinement skipped: {type(e).__name__}: {e}")
+    return fields
 
-            import json
-            parsed = json.loads(raw)
 
-            # Only fill in fields that are still empty
-            if not meta["title"]   and parsed.get("title"):
-                meta["title"]   = parsed["title"]
-            if not meta["authors"] and parsed.get("authors"):
-                meta["authors"] = parsed["authors"]
-            if not meta["year"]    and parsed.get("year"):
-                meta["year"]    = int(parsed["year"])
-            if not meta["venue"]   and parsed.get("venue"):
-                meta["venue"]   = parsed["venue"]
+# ─────────────────────────────────────────────────────────────────────
+#  MAIN PARSER
+# ─────────────────────────────────────────────────────────────────────
 
-        except Exception:
-            pass   # If LLM fails, we just use whatever we have
+class PDFParser:
+    def __init__(self, file_path: str):
+        self.file_path = file_path
+        self.doc = fitz.open(file_path)
+        self.pm = PageModel(self.doc)
 
-        return meta
-
-    # ================================================================== #
-    #  MAIN PARSE METHOD
-    #  This is the entry point — it calls everything above in order.
-    #
-    #  The complete flow:
-    #    1. Detect PDF type
-    #    2. Extract full text
-    #    3. Normalize unicode 
-    #    4. Detect repeating headers/footers 
-    #    5. Clean text
-    #    6. Extract sections 
-    #    7. Extract metadata
-    #    8. LLM fallback if needed
-    #    9. Extract references
-    #    10. Build and return ResearchPaper object
-    # ================================================================== #
-
-    def parse(self, paper_id: str = None, llm=None) -> ResearchPaper:
-        """
-        Parse a PDF file into a ResearchPaper object.
-
-        paper_id: optional ID string. If not provided, a random 8-char ID is generated.
-        llm: optional LangChain LLM instance for metadata fallback.
-        """
+    def parse(self, paper_id: Optional[str] = None, llm=None) -> ResearchPaper:
         if paper_id is None:
             paper_id = str(uuid.uuid4())[:8]
 
-        # Early exit for scanned PDFs — we can't extract text from images
-        if self.pdf_type == "scanned":
+        if self.pm.layout == "scanned":
             return ResearchPaper(
-                paper_id = paper_id,
-                title    = paper_id,
-                abstract = (
-                    "⚠️ This PDF appears to be scanned (image-only). "
-                    "Text extraction requires OCR which is not currently supported."
+                paper_id=paper_id,
+                title=paper_id,
+                abstract=(
+                    " This PDF appears to be scanned (image-only). "
+                    "Text extraction requires OCR which is not currently "
+                    "supported."
                 ),
+                page_count=len(self.doc),
             )
 
-        # Step 1: Extract raw text
-        full_text = self._get_full_text()
+        full_text = _normalize(self.pm.column_aware_text())
+        clean_text = _clean_text(full_text, self.pm.repeating)
 
-        # Step 2:  — Normalize unicode (ligatures, dashes, PUA chars)
-        full_text = self._normalize_text(full_text)
+        anchors = _detect_anchors(self.pm)
+        sections = _split_sections(self.pm, anchors, clean_text)
 
-        # Step 3: — Detect repeating header/footer lines
-        repeating_lines = self._detect_repeating_lines()
+        meta = self.doc.metadata or {}
+        pdf_title = (meta.get("title") or "").strip() or None
+        pdf_authors = (meta.get("author") or "").strip() or None
 
-        # Step 4: Clean text (removes page numbers, noise, + repeating lines)
-        clean_text = self._clean_text(full_text, repeating_lines)
+        # Independent extractors — each reads PageModel directly,
+        # not each other's output.
+        title_ex = extract_title(self.pm, pdf_title)
+        authors_ex = extract_authors(self.pm, title_ex.value, pdf_authors)
+        head = clean_text[:3500]
+        year_ex = extract_year(head)
+        venue_ex = extract_venue(head)
 
-        # Step 5: Extract sections (FIX 3 — line-anchored splitting is inside)
-        sections = self._extract_structured_sections(clean_text)
+        fields = {
+            "title": title_ex,
+            "authors": authors_ex,
+            "year": year_ex,
+            "venue": venue_ex,
+        }
+        if llm is not None:
+            first_page = "\n".join(
+                l.text for l in self.pm.lines if l.page == 0
+            )[:2500]
+            fields = llm_refine(fields, first_page, llm)
 
-        # Step 6: Extract metadata
-        meta = self.extract_metadata(clean_text)
+        abstract_ex = extract_abstract(self.pm, sections, clean_text)
+        # Keywords often appear after a long author/affiliation block — widen
+        # the scan window beyond the 3500-char `head` so they aren't missed.
+        keywords = extract_keywords(clean_text[:8000])
+        parsed_refs, raw_refs = extract_references(sections)
 
-        # Step 7: LLM fallback if title or authors still missing
-        if llm and (not meta["title"] or not meta["authors"]):
-            meta = self._llm_metadata_fallback(meta, clean_text[:2000], llm)
-
-        # Step 8: Extract references
-        parsed_refs, raw_refs = self.extract_references(sections)
-
-        # Step 9: Get abstract (prefer dedicated Abstract section,
-        # fallback to first 500 chars of clean text)
-        abstract = next(
-            (s.content for s in sections if "abstract" in s.section_name.lower()),
-            clean_text[:500],
-        )
-
-        # Step 10: Build and return the ResearchPaper object
         return ResearchPaper(
-            paper_id       = paper_id,
-            title          = meta["title"] or paper_id,
-            authors        = meta["authors"],
-            abstract       = abstract,
-            year           = meta["year"],
-            venue          = meta["venue"],
-            keywords       = meta["keywords"],
-            sections       = sections,
-            references     = parsed_refs,
-            raw_references = raw_refs or None,
-            full_text      = clean_text,
-            page_count     = len(self.doc),   # ← ADD THIS
+            paper_id=paper_id,
+            title=fields["title"].value or paper_id,
+            authors=fields["authors"].value or [],
+            abstract=abstract_ex.value or "",
+            year=fields["year"].value,
+            venue=fields["venue"].value,
+            keywords=keywords,
+            sections=sections,
+            references=parsed_refs,
+            raw_references=raw_refs or None,
+            full_text=clean_text,
+            page_count=len(self.doc),
         )
-
-    # ================================================================== #
-    #  The "with" statement calls __enter__ and __exit__ automatically:
-    #    with PDFParser("paper.pdf") as parser:
-    #        paper = parser.parse()
-    #  ← file is automatically closed here
-    # ================================================================== #
 
     def close(self):
         if self.doc:

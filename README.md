@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 🔬 Research Paper Management & Analysis System
 
 An AI-powered research assistant that helps you **discover, organize, analyze, and interact** with academic research papers using LLMs, vector search, and intelligent tool integration.
@@ -7,6 +8,55 @@ Built with LangChain, Groq, FAISS, and Streamlit.
 Link:https://researchpapermanagementandanalysis-ke6tnztrz7kma55zwlazse.streamlit.app/
 ---
 
+=======
+# Research Intelligence System
+
+An AI-powered research assistant for managing, analyzing, and querying academic papers. Upload PDFs and the system extracts structured metadata, indexes content into a vector store, and lets you ask questions across single papers or your whole library — with an optional tool-calling agent that reaches Semantic Scholar and Tavily when local context isn't enough.
+
+
+Link:https://researchpapermanagementandanalysis-ke6tnztrz7kma55zwlazse.streamlit.app/
+
+---
+
+## Features
+
+
+- **Three Q&A modes** — single-paper, entire-library, and cross-paper comparison (with reference filtering to prevent citation confusion)
+- **Tool-calling agent** — LangChain v1 `create_agent` bound to MCP-style tools (Semantic Scholar metadata, related-work, trend analytics) with Tavily fallback
+- **Auto-generated summaries** — on-demand Short + Structured summaries grounded in the paper's own text
+- **Trend analytics** — papers/year, venue breakdown, LLM-assigned categories, emerging-trends filter, citation network with internal/external citation tracking
+
+## Architecture
+
+```
+PDF upload
+    - PDFParser (PyMuPDF + heuristics + LLM refine)
+    - ResearchIndexer (HuggingFace embeddings + FAISS)
+    - ResearchPaper objects in session state
+
+Chat query
+    - ResearchRAG (plain LangChain) ─OR─ ResearchAgent (tool-calling)
+    - Groq Llama 3.3-70B
+    - answer + sources + tool-call trace
+```
+
+
+
+## Tech Stack
+
+| Layer | Technology |
+|---|---|
+| UI | Streamlit |
+| LLM | Groq (`llama-3.3-70b-versatile`) |
+| Orchestration | LangChain v1 (`create_agent`) |
+| Embeddings | HuggingFace `all-MiniLM-L6-v2` (CPU) |
+| Vector store | FAISS (in-memory) |
+| PDF | PyMuPDF (`fitz`) |
+| External research | Semantic Scholar API |
+| Web search | Tavily |
+| Schema | Pydantic 2 |
+
+>>>>>>> c329d43 (changes in parser and mcp tools)
 ## Screenshots
 
 
@@ -17,6 +67,7 @@ Link:https://researchpapermanagementandanalysis-ke6tnztrz7kma55zwlazse.streamlit
 | <img width="1915" height="848" alt="image" src="https://github.com/user-attachments/assets/d955b07a-c694-4067-b380-2f6913c88ead" />|<img width="1890" height="871" alt="image" src="https://github.com/user-attachments/assets/0e187856-78b8-4dd1-9857-d06d6faeb66b" />|<img width="1863" height="861" alt="image" src="https://github.com/user-attachments/assets/c013ac4d-9dae-4d60-a88d-2b555a20be12" />
 
 ---
+<<<<<<< HEAD
 
 ##  Features
 
@@ -187,3 +238,56 @@ Streamlit UI
 - [Streamlit](https://streamlit.io) — Rapid UI development for Python
 
 ---
+=======
+## Overview
+
+1. **📚 Library Dashboard** — upload PDFs, edit metadata inline
+2. **🤖 Chat Assistant** — ask questions in three modes:
+   - 🌐 Entire Library — RAG across all papers
+   - 📄 Single Paper — RAG filtered to one paper, with optional research agent
+   - ⚖️ Compare Papers — cross-paper synthesis (per-paper retrieval merged into one prompt)
+3. **📈 Trend Insights** — library overview, LLM-tagged categories, emerging trends, citation network
+
+## Project Layout
+
+```
+.
+├── app.py                       # Streamlit entry point + session state
+├── core/
+│   ├── parser.py                # PDF → ResearchPaper (layout-aware)
+│   ├── indexer.py               # Chunking + FAISS
+│   ├── rag_pipeline.py          # Plain RAG (summary, ask, compare)
+│   └── agent.py                 # LangChain tool-calling agent
+├── tools/
+│   ├── mcp_tools.py             # Semantic Scholar + Tavily tools (agent-bound)
+│   └── search_tool.py           # Tavily fallback wrapper (non-agent)
+├── analytics/
+│   └── trends.py                # Library/citation/trend aggregation
+├── models/
+│   └── schemas.py               # Pydantic schemas
+├── ui/
+│   ├── library_view.py          # 📚 Library Dashboard
+│   ├── chat_view.py             # 🤖 Chat Assistant
+│   └── analytics_view.py        # 📈 Trend Insights    
+|                   
+├── docs/
+│   └── architecture.md          # System architecture + Mermaid diagram
+├── requirements.txt
+└── README.md
+```
+
+## Limitations
+
+- FAISS is in-memory — uploaded papers are lost on restart
+- Single-user Streamlit (no auth, no multi-tenant isolation)
+- Free-tier Groq has a 100k token-per-day cap on the 70B model; the system surfaces 429 errors clearly but doesn't auto-fall-back to a smaller model
+- Semantic Scholar's public API rate-limits aggressively (~100 req / 5 min shared); a free API key bumps this to ~1 req/sec
+- Scanned PDFs are detected but not OCR'd — text-only PDFs are required
+
+## Acknowledgements
+
+- LangChain for the agent runtime
+- Groq for fast inference
+- Semantic Scholar for open research metadata
+- Tavily for web-search fallback
+>>>>>>> c329d43 (changes in parser and mcp tools)

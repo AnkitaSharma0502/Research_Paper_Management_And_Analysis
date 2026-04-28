@@ -46,7 +46,7 @@ class ResearchRAG:
     def generate_summary(self, paper: ResearchPaper) -> str:
         """
         Generates a two-part structured summary:
-          1. Short Summary  (4-5 bullets)
+          1. Short Summary  (5-6 bullets)
           2. Structured Summary  (Problem / Approach / Contributions /
                                   Results / Limitations)
 
@@ -182,26 +182,36 @@ Provide a clear, professional, and well-structured answer.
         """
         Answers comparative questions across multiple papers.
 
-        Retrieves the top-3 chunks from each specified paper, then
+        Retrieves the top-4 chunks from each specified paper (excluding
+        Reference/Bibliography sections to avoid citation confusion) and
         synthesises a structured comparison in a single LLM call.
-        the prompt instructs the LLM to emit FALLBACK_SIGNAL when the
-        context doesn't contain a good answer. chat_view.py checks for this
-        signal and triggers Tavily web search, exactly as it already does
-        for ask_question().
+
+        If retrieval finds nothing useful, the prompt emits FALLBACK_SIGNAL,
+        but chat_view INTENTIONALLY does not trigger web fallback in compare
+        mode — Tavily can't answer cross-paper questions.
 
         Args:
             query:        Comparison question (e.g. "Compare the methods used").
             vector_store: FAISS vector store instance.
             paper_ids:    List of paper_ids to compare.
         """
-        # Retrieve top-3 chunks from each selected paper
+        # Over-fetch then drop reference/bibliography chunks — those contain
+        # citations to other papers that the LLM confuses with comparison
+        # candidates, ballooning a 2-paper compare into 4+ table rows.
         all_docs = []
         for pid in paper_ids:
             docs = vector_store.similarity_search(
                 query,
-                k=3,
+                k=6,
                 filter={"paper_id": pid},
             )
+            docs = [
+                d for d in docs
+                if not any(
+                    w in d.metadata.get("section_name", "").lower()
+                    for w in ("reference", "bibliograph", "works cited")
+                )
+            ][:4]
             all_docs.extend(docs)
 
         if not all_docs:
@@ -212,28 +222,43 @@ Provide a clear, professional, and well-structured answer.
 
         context = self._format_docs(all_docs)
 
+        # Pin the comparison set so the LLM can't drift into citing papers
+        # it saw inside the retrieved chunks.
+        titles = sorted({
+            d.metadata.get("title", "Unknown") for d in all_docs
+        })
+        titles_block = "\n".join(f"- {t}" for t in titles)
+
         compare_prompt = ChatPromptTemplate.from_template("""
-You are an experienced research analyst tasked with comparing multiple research papers.
+You are an experienced research analyst comparing EXACTLY these {n_papers} papers and no others:
+{titles_block}
+
+Do not introduce any paper outside this list. Any paper titles appearing
+inside the CONTEXT below as citations or references are NOT papers to
+compare — they are only background for the listed papers.
 
 Answer the comparison question using ONLY the context provided below.
 
-If the comparison question cannot be answered from the provided context
-(e.g. the question is about something not covered in these papers),
+If the comparison question cannot be answered from the provided context,
 respond with exactly:
 "{fallback_signal}"
 
 Otherwise, structure your response as:
-1. A brief section for each paper summarising its relevant approach.
-2. A side-by-side comparison table (if applicable).
+1. A brief section for each of the {n_papers} listed papers summarising its relevant approach.
+2. A side-by-side comparison table with EXACTLY {n_papers} rows — two per listed paper.
 3. An overall comparative conclusion.
 
 
 CONTEXT:
 {{context}}
 
-COMPARISON QUESTION: 
+COMPARISON QUESTION:
 {{question}}
-""".format(fallback_signal=FALLBACK_SIGNAL))
+""".format(
+            fallback_signal=FALLBACK_SIGNAL,
+            n_papers=len(titles),
+            titles_block=titles_block,
+        ))
 
         chain  = compare_prompt | self.llm | StrOutputParser()
         answer = chain.invoke({"context": context, "question": query})

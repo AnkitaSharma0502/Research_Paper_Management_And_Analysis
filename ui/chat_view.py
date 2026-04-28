@@ -1,54 +1,28 @@
 import streamlit as st
 from tools.search_tool import ResearchSearchTool
-
-
-# Phrases that indicate the RAG couldn't find an answer locally
-FALLBACK_TRIGGERS = [
-    "don't have enough information",
-    "not mentioned",
-    "cannot find",
-    "do not know",
-    "not in the provided",
-    "no information",
-    "not discussed",
-    "not available",
-    "couldn't find",
-    "not found",
-]
+from core.rag_pipeline import FALLBACK_SIGNAL
 
 
 def _needs_web_search(answer: str) -> bool:
-    """Returns True if the LLM answer signals it couldn't find info locally."""
-    answer_lower = answer.lower()
-    return any(trigger in answer_lower for trigger in FALLBACK_TRIGGERS)
-
-
-def _smart_truncate(text: str, limit: int = 500) -> str:
-    """
-    Truncates text at the last complete sentence within the limit.
-    Prevents mid-sentence cuts in the UI display.
-    """
-    if len(text) <= limit:
-        return text
-    truncated   = text[:limit]
-    last_period = truncated.rfind('.')
-    if last_period > 0:
-        return truncated[:last_period + 1] + " ..."
-    return truncated + "..."
+    # Only the exact sentinel enforced by the RAG prompt triggers fallback.
+    # Fuzzy matches like "not discussed" wrongly hijacked grounded answers
+    # that legitimately described what a paper didn't cover.
+    return FALLBACK_SIGNAL.lower() in (answer or "").lower()
 
 
 # ------------------------------------------------------------------ #
 #  MAIN RENDER
 # ------------------------------------------------------------------ #
 
-def render(rag_engine):
+def render(rag_engine, research_agent=None):
     """
     Renders the Research Chat Assistant.
-    Covers Part VI Task 16:
+    Covers Part VI Task 16 + Part IV Task 11:
       - Single paper Q&A
       - Full library Q&A
       - Cross-paper comparison
       - Web search fallback when local answer not found
+      - Optional agent mode with MCP tools (Semantic Scholar + Tavily)
     """
     st.header("🤖 Research Chat Assistant")
     st.caption("Ask questions about your library. Falls back to live web search if needed.")
@@ -101,13 +75,39 @@ def render(rag_engine):
             return
 
     # ------------------------------------------------------------------ #
-    #  WEB SEARCH TOGGLE
+    #  MODE TOGGLES
+    #  - Web fallback: Entire Library + Single Paper only.
+    #    (Compare mode: Tavily can't answer cross-paper questions.)
+    #  - Agent: Single Paper only.
+    #    (Entire Library: tool-loops are token-heavy across many papers.
+    #     Compare: agent may skip a paper, breaking guaranteed coverage.)
     # ------------------------------------------------------------------ #
-    enable_web = st.toggle(
-        "🌍 Enable web search fallback",
-        value=True,
-        help="If the answer is not found in your library will search the web automatically.",
-    )
+    enable_web = False
+    use_agent  = False
+
+    if mode == "📄 Single Paper":
+        col1, col2 = st.columns(2)
+        with col1:
+            enable_web = st.toggle(
+                "🌍 Enable web search fallback",
+                value=True,
+                help="If the answer is not found in your library, the web is searched automatically.",
+            )
+        with col2:
+            use_agent = st.toggle(
+                "🤖 Use research agent (tools)",
+                value=False,
+                help="LLM decides when to call Semantic Scholar / Tavily / local library. "
+                     "Required for metadata, related-work, and trend questions.",
+                disabled=(research_agent is None),
+            )
+    elif mode == "🌐 Entire Library":
+        enable_web = st.toggle(
+            "🌍 Enable web search fallback",
+            value=True,
+            help="If the answer is not found in your library, the web is searched automatically.",
+        )
+    # Compare Papers: no toggles — pure local RAG only.
 
     # ------------------------------------------------------------------ #
     #  CHAT HISTORY
@@ -145,28 +145,51 @@ def render(rag_engine):
             try:
                 vector_store = indexer.vector_store
                 sources      = []
+                tool_calls   = []
                 used_web     = False
+                used_agent   = False
 
-                # ── Step 1: Search local library ──────────────────────
-                with st.spinner("🔍 Searching local library..."):
-                    if mode == "⚖️ Compare Papers":
-                        result = rag_engine.compare_papers(
-                            query        = query,
-                            vector_store = vector_store,
-                            paper_ids    = compare_ids,
+                # ── Step 1: Agent path or plain RAG ───────────────────
+                if use_agent and research_agent is not None and mode != "⚖️ Compare Papers":
+                    with st.spinner("🤖 Agent reasoning with tools..."):
+                        selected_title = (
+                            paper_store[selected_paper_id].title
+                            if selected_paper_id and selected_paper_id in paper_store
+                            else None
                         )
-                    else:
-                        result = rag_engine.ask_question(
+                        result = research_agent.run(
                             query        = query,
                             vector_store = vector_store,
                             paper_id     = selected_paper_id,
+                            paper_title  = selected_title,
                         )
+                        answer     = result.get("answer", "")
+                        sources    = result.get("sources", [])
+                        tool_calls = result.get("tool_calls", [])
+                        used_agent = True
+                else:
+                    with st.spinner("🔍 Searching local library..."):
+                        if mode == "⚖️ Compare Papers":
+                            result = rag_engine.compare_papers(
+                                query        = query,
+                                vector_store = vector_store,
+                                paper_ids    = compare_ids,
+                            )
+                        else:
+                            result = rag_engine.ask_question(
+                                query        = query,
+                                vector_store = vector_store,
+                                paper_id     = selected_paper_id,
+                            )
 
-                    answer  = result.get("answer", "")
-                    sources = result.get("sources", [])
+                        answer  = result.get("answer", "")
+                        sources = result.get("sources", [])
 
-                # ── Step 2: Web fallback if needed ────────────────────
-                if enable_web and _needs_web_search(answer):
+                # ── Step 2: Web fallback if needed (non-agent path) ───
+                # Skip fallback in Compare mode — Tavily can't answer cross-paper
+                # comparison questions and just produces unrelated noise.
+                if (not used_agent and enable_web and mode != "⚖️ Compare Papers"
+                        and _needs_web_search(answer)):
                     with st.spinner("🌍 Not found locally. Searching the web..."):
                         try:
                             search_tool = ResearchSearchTool()
@@ -197,6 +220,8 @@ Give a clear, professional answer. Mention that this is from web search, not the
                 # Source badge
                 if used_web:
                     st.info("🌍 Source: Live Web Search")
+                elif used_agent:
+                    st.info("🤖 Source: Research Agent (tools)")
                 elif sources:
                     st.success("📚 Source: Local Research Library")
 
@@ -214,11 +239,22 @@ Give a clear, professional answer. Mention that this is from web search, not the
                                     f" ({src.get('year', 'N/A')})"
                                 )
 
+                # Tool-calls expander (agent mode only)
+                if tool_calls:
+                    with st.expander(f"🔧 Research tools used ({len(tool_calls)})", expanded=False):
+                        for i, tc in enumerate(tool_calls, 1):
+                            st.markdown(
+                                f"**{i}. `{tc['name']}`**\n\n"
+                                f"  - **Input:** `{tc['input']}`\n"
+                                f"  - **Output (truncated):** {tc['output']}"
+                            )
+
                 # Persist to history
                 st.session_state[history_key].append({
-                    "role":    "assistant",
-                    "content": answer,
-                    "sources": sources if not used_web else [],
+                    "role":       "assistant",
+                    "content":    answer,
+                    "sources":    sources if not used_web else [],
+                    "tool_calls": tool_calls,
                 })
 
             except Exception as e:

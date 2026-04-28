@@ -21,6 +21,7 @@ def _assign_categories(papers, rag_engine) -> dict:
         return st.session_state.paper_categories
 
     categories = {}
+    failures   = 0
     progress   = st.progress(0, text="Analyzing paper topics...")
     total      = len(papers)
 
@@ -41,10 +42,18 @@ Return ONLY the category name, nothing else. No explanation."""
 
         except Exception:
             categories[paper.paper_id] = "Uncategorized"
+            failures += 1
 
         progress.progress((i + 1) / total, text=f"Categorizing: {paper.title[:40]}...")
 
     progress.empty()
+
+    if failures:
+        st.warning(
+            f" Categorized {total - failures}/{total} papers — "
+            f"{failures} failed (likely rate-limited). "
+            "Click **Reset Categories** then **Analyze Topics** to retry."
+        )
 
     st.session_state.paper_categories   = categories
     st.session_state.category_paper_ids = list(current_ids)
@@ -244,20 +253,24 @@ def render(analyzer: TrendAnalyzer, rag_engine):
 
             rows = []
             for title, edges in citation_graph.items():
-                refs     = edges.get("references", [])
-                cited_by = edges.get("cited_by",   [])
                 rows.append({
-                    "Paper":      title,
-                    "References": len(refs),     # count only — no raw titles
-                    "Cited By":   len(cited_by), # count only
+                    "Paper":          title,
+                    "Total Refs":     len(edges.get("raw_references", [])),
+                    "Local Refs":     len(edges.get("references",     [])),
+                    "Cited By":       len(edges.get("cited_by",       [])),
                 })
 
-            graph_df = pd.DataFrame(rows).sort_values("References", ascending=False)
+            graph_df = pd.DataFrame(rows).sort_values("Total Refs", ascending=False)
 
             st.dataframe(
-                graph_df[["Paper", "References", "Cited By"]],
+                graph_df[["Paper", "Total Refs", "Local Refs", "Cited By"]],
                 use_container_width=True,
                 hide_index=True,
+            )
+            st.caption(
+                "**Total Refs** = all references parsed from this paper. "
+                "**Local Refs** = references resolved to another paper in your library. "
+                "**Cited By** = other library papers that cite this one."
             )
 
             # ── Cited-by connections (library papers only) ─────────────

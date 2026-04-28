@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 
 from core.indexer import ResearchIndexer
 from core.rag_pipeline import ResearchRAG
+from core.agent import ResearchAgent
 from analytics.trends import TrendAnalyzer
 from ui import library_view, chat_view, analytics_view
 
@@ -13,7 +14,7 @@ load_dotenv()
 
 st.set_page_config(
     page_title="AI Research Intelligence",
-    page_icon="🔬",
+    page_icon="",
     layout="wide",
 )
 
@@ -26,25 +27,31 @@ if "paper_store" not in st.session_state:
 if "indexer" not in st.session_state:
     st.session_state.indexer = ResearchIndexer()
 
-if "rag_engine" not in st.session_state:
+if "rag_engine" not in st.session_state or "research_agent" not in st.session_state:
     groq_key = os.getenv("GROQ_API_KEY")
     if not groq_key:
         st.error(
-            "❌ GROQ_API_KEY is not set. "
+            " GROQ_API_KEY is not set. "
             "Add it to your .env file and restart the app."
         )
         st.stop()
 
-    st.session_state.rag_engine = ResearchRAG(
-        api_key=groq_key,
-        model_name="llama-3.3-70b-versatile",
-    )
+    if "rag_engine" not in st.session_state:
+        st.session_state.rag_engine = ResearchRAG(
+            api_key=groq_key,
+            model_name="llama-3.3-70b-versatile",
+        )
+    if "research_agent" not in st.session_state:
+        st.session_state.research_agent = ResearchAgent(
+            api_key=groq_key,
+            model_name="llama-3.3-70b-versatile",
+        )
 
 # ------------------------------------------------------------------ #
 #  SIDEBAR
 # ------------------------------------------------------------------ #
 with st.sidebar:
-    st.title("🔬 Research Assistant")
+    st.title(" Research Assistant")
     st.markdown("---")
 
     page = st.radio(
@@ -62,7 +69,7 @@ with st.sidebar:
     indexed  = st.session_state.indexer.vector_store is not None
 
     st.metric("Papers in Library", n_papers)
-    st.caption(f"Index status: {'✅ Ready' if indexed else '⚠️ Empty'}")
+    st.caption(f"Index status: {' Ready' if indexed else '⚠️ Empty'}")
 
     st.markdown("---")
     st.caption("Powered by LangChain · Groq · FAISS · Streamlit")
@@ -78,7 +85,8 @@ if page == "📚 Library Dashboard":
 
 elif page == "🤖 Chat Assistant":
     chat_view.render(
-        rag_engine = st.session_state.rag_engine,
+        rag_engine     = st.session_state.rag_engine,
+        research_agent = st.session_state.get("research_agent"),
     )
 
 elif page == "📈 Trend Insights":

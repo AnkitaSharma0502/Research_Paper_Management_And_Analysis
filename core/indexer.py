@@ -9,11 +9,6 @@ from typing import List, Optional
 # Sections short enough to keep whole — never chunk these
 SHORT_SECTIONS = {"abstract", "conclusion", "future work", "acknowledgements"}
 
-# Sections where we want finer chunking
-LONG_SECTIONS  = {"methodology", "method", "experiments", "results",
-                  "evaluation", "discussion", "related work",
-                  "literature review", "introduction", "background"}
-
 
 class ResearchIndexer:
     def __init__(self):
@@ -41,14 +36,14 @@ class ResearchIndexer:
                   
                 )
             from langchain_huggingface import HuggingFaceEndpointEmbeddings
-            print("🌐 Using HuggingFace Inference API for embeddings.")
+            print(" Using HuggingFace Inference API for embeddings.")
             return HuggingFaceEndpointEmbeddings(
                 model=model_name,
                 huggingfacehub_api_token=hf_token,
             )
         else:
             from langchain_huggingface import HuggingFaceEmbeddings
-            print("💻 Using local HuggingFace model for embeddings.")
+            print(" Using local HuggingFace model for embeddings.")
             return HuggingFaceEmbeddings(
                 model_name=model_name,
                 model_kwargs={"device": "cpu"},
@@ -170,7 +165,7 @@ class ResearchIndexer:
         """Generates embeddings for one paper and adds them to FAISS."""
         chunks = self.create_chunks(paper)
         if not chunks:
-            print(f"⚠️  No chunks generated for: {paper.title}")
+            print(f"  No chunks generated for: {paper.title}")
             return
 
         if self.vector_store is None:
@@ -178,57 +173,9 @@ class ResearchIndexer:
         else:
             self.vector_store.add_documents(chunks)
 
-        print(f"✅ Indexed '{paper.title}' ({len(chunks)} chunks)")
-
-    def index_papers(self, papers: List[ResearchPaper]) -> None:
-        """Indexes a list of papers in one call."""
-        for paper in papers:
-            self.index_paper(paper)
-        print(f"\n📚 Total papers indexed: {len(papers)}")
-
-    # ------------------------------------------------------------------ #
-    #  SEARCH
-    # ------------------------------------------------------------------ #
-
-    def semantic_search(
-        self,
-        query: str,
-        top_k: int = 5,
-        filters: Optional[dict] = None,
-    ) -> List[Document]:
-        """Natural-language search across the indexed library."""
-        if self.vector_store is None:
-            print("⚠️  Vector store is empty. Index some papers first.")
-            return []
-
-        search_kwargs = {"k": top_k}
-        if filters:
-            search_kwargs["filter"] = filters
-
-        return self.vector_store.similarity_search(query, **search_kwargs)
-
-    # ------------------------------------------------------------------ #
-    #  PERSISTENCE
-    # ------------------------------------------------------------------ #
-
-    def save_index(self, folder_path: str) -> None:
-        """Saves the FAISS index to disk."""
-        if self.vector_store:
-            self.vector_store.save_local(folder_path)
-            print(f"💾 Index saved to '{folder_path}'")
-        else:
-            print("⚠️  Nothing to save — vector store is empty.")
-
-    def load_index(self, folder_path: str) -> None:
-        """Loads a previously saved FAISS index from disk."""
-        self.vector_store = FAISS.load_local(
-            folder_path,
-            self.embeddings,
-            allow_dangerous_deserialization=True,
-        )
-        print(f"📂 Index loaded from '{folder_path}'")
+        print(f" Indexed '{paper.title}' ({len(chunks)} chunks)")
 
     def clear_index(self) -> None:
         """Resets the vector store."""
         self.vector_store = None
-        print("🗑️  Index cleared.")
+        print("  Index cleared.")

@@ -1,4 +1,5 @@
 import os
+import time
 import requests
 from langchain.tools import tool
 from typing import Optional
@@ -14,7 +15,7 @@ def _get_tavily():
         raise EnvironmentError(
             "TAVILY_API_KEY is not set. Add it to your .env file."
         )
-    # ✅ Correct class: TavilySearch (not TavilySearchResults)
+    #  Correct class: TavilySearch (not TavilySearchResults)
     from langchain_tavily import TavilySearch
     return TavilySearch(max_results=5)
 
@@ -26,22 +27,37 @@ def _get_tavily():
 SEMANTIC_SCHOLAR_BASE = "https://api.semanticscholar.org/graph/v1"
 
 
-def _semantic_scholar_search(title: str) -> Optional[dict]:
-    try:
-        params = {
-            "query":  title,
-            "limit":  1,
-            "fields": "title,year,venue,citationCount,authors,externalIds",
-        }
-        resp = requests.get(
-            f"{SEMANTIC_SCHOLAR_BASE}/paper/search",
-            params=params, timeout=10,
-        )
-        resp.raise_for_status()
-        results = resp.json().get("data", [])
-        return results[0] if results else None
-    except Exception:
-        return None
+def _semantic_scholar_search(title: str, retries: int = 2) -> Optional[dict]:
+    """
+    Searches Semantic Scholar with retry on 429/5xx. The free tier rate-limits
+    aggressively; without retries a single 429 makes the tool fall through to
+    Tavily, which returns unrelated "how to find citations" articles.
+    """
+    params = {
+        "query":  title,
+        "limit":  1,
+        "fields": "title,year,venue,citationCount,authors,externalIds",
+    }
+    for attempt in range(retries + 1):
+        try:
+            resp = requests.get(
+                f"{SEMANTIC_SCHOLAR_BASE}/paper/search",
+                params=params, timeout=10,
+            )
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < retries:
+                    time.sleep(1.5 * (attempt + 1))
+                    continue
+                return None
+            resp.raise_for_status()
+            results = resp.json().get("data", [])
+            return results[0] if results else None
+        except requests.RequestException:
+            if attempt < retries:
+                time.sleep(1.5 * (attempt + 1))
+                continue
+            return None
+    return None
 
 
 def _semantic_scholar_related(paper_id: str, limit: int = 5) -> list:
@@ -58,21 +74,24 @@ def _semantic_scholar_related(paper_id: str, limit: int = 5) -> list:
 
 
 def _parse_tavily_results(results) -> str:
-    """Parses TavilySearch results (may be JSON string or list)."""
+    """Parses TavilySearch results across its possible return shapes:
+    JSON string, dict with 'results' key, or list of result dicts."""
     import json
     if isinstance(results, str):
         try:
-            parsed = json.loads(results)
-            if isinstance(parsed, dict):
-                items = parsed.get("results", [])
-            else:
-                items = parsed
+            results = json.loads(results)
         except Exception:
             return results
+
+    if isinstance(results, dict):
+        items = results.get("results", [])
     elif isinstance(results, list):
         items = results
     else:
         return str(results)
+
+    if not items:
+        return "[Web search returned no results]"
 
     snippets = "\n\n".join(
         f"- {r.get('title','')}: {r.get('content','')[:200]}"
@@ -104,13 +123,22 @@ def paper_metadata_lookup(query: str) -> str:
             f"Source        : Semantic Scholar"
         )
 
-    # Fallback: Tavily
+    # Fallback: Tavily — search for the paper itself, not articles about metadata.
     try:
         tavily  = _get_tavily()
-        results = tavily.invoke({"query": f"research paper metadata year venue citation count: {query}"})
-        return _parse_tavily_results(results)
+        results = tavily.invoke({"query": f'"{query}" research paper'})
+        parsed  = _parse_tavily_results(results)
+        return (
+            "Semantic Scholar had no record of this paper. "
+            "Web search results below — these may NOT contain a citation count; "
+            "if not present, say so plainly instead of guessing.\n\n" + parsed
+        )
     except Exception as e:
-        return f"Error retrieving metadata: {e}"
+        return (
+            f"No metadata could be retrieved for '{query}'. "
+            f"Semantic Scholar returned no match and web search failed ({e}). "
+            f"Tell the user the citation count is unavailable."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -141,10 +169,18 @@ def related_work_discovery(paper_title: str) -> str:
     # Fallback: Tavily
     try:
         tavily  = _get_tavily()
-        results = tavily.invoke({"query": f"research papers related to or citing: {paper_title}"})
-        return _parse_tavily_results(results)
+        results = tavily.invoke({"query": f'papers related to "{paper_title}"'})
+        return (
+            "Semantic Scholar had no record of this paper, so citation-based "
+            "neighbours are unavailable. Web results below may suggest related "
+            "work but cannot be confirmed as actual citations:\n\n"
+            + _parse_tavily_results(results)
+        )
     except Exception as e:
-        return f"Error discovering related work: {e}"
+        return (
+            f"No related work could be retrieved for '{paper_title}' "
+            f"(Semantic Scholar miss; web search error: {e})."
+        )
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -157,7 +193,7 @@ def trend_analytics_tool(topic: str) -> str:
     Identify publication frequency and emerging subtopics for a research area.
     Input: Research topic or keyword.
     """
-    output_lines = [f"📊 Trend Analytics for: '{topic}'\n"]
+    output_lines = [f" Trend Analytics for: '{topic}'\n"]
 
     # Semantic Scholar: year-wise counts
     try:

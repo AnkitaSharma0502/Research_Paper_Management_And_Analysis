@@ -49,13 +49,5 @@ class ResearchPaper(BaseModel):
         description="Citation objects with context (cited_by relationships)",
     )
 
-    citation_count: int = 0
-    page_count: Optional[int] = None     
-    reading_status: Literal["to-read", "reading", "completed"] = "to-read"  #literaal used so only can read no change
-
-    #  user_notes is now ONLY for user-written notes — not misused for internal data
-    user_notes: Optional[str] = None
-
-    model_config = {"from_attributes": True}  #a compatibility setting for when data comes from databases or other frameworks
-
-    
+    page_count: Optional[int] = None
+    reading_status: Literal["to-read", "reading", "completed"] = "to-read"
