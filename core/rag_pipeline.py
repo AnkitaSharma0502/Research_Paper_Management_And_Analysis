@@ -3,7 +3,6 @@ from typing import Dict, List, Optional
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 from models.schemas import ResearchPaper
 
@@ -46,7 +45,7 @@ class ResearchRAG:
     def generate_summary(self, paper: ResearchPaper) -> str:
         """
         Generates a two-part structured summary:
-          1. Short Summary  (5-6 bullets)
+          1. Short Summary  (4-5 bullets)
           2. Structured Summary  (Problem / Approach / Contributions /
                                   Results / Limitations)
 
@@ -82,7 +81,7 @@ CONTENT:
 Please provide:
 
 ## Short Summary
-(3-4 concise bullet points capturing the paper's essence)
+(4-5 concise bullet points capturing the paper's essence)
 
 ## Structured Summary
 
@@ -129,8 +128,15 @@ Maintain a neutral, academic tone throughout.
         search_kwargs: dict = {"k": 5}
         if paper_id:
             search_kwargs["filter"] = {"paper_id": paper_id}
+            # FAISS post-filters from a candidate pool (fetch_k). With the default
+            # fetch_k=20, chunks from the target paper may not appear in that pool
+            # when the library is large. 50 gives a big enough pool without hurting
+            # performance (embeddings are already computed, this is just a sort).
+            search_kwargs["fetch_k"] = 50
 
-        retriever = vector_store.as_retriever(search_kwargs=search_kwargs)
+        # Retrieve once — reuse docs for both context and sources display
+        docs    = vector_store.similarity_search(query, **search_kwargs)
+        context = self._format_docs(docs)
 
         qa_prompt = ChatPromptTemplate.from_template("""
 You are a technical research assistant.
@@ -146,23 +152,14 @@ CONTEXT:
 {{context}}
 
 
-QUESTION: 
+QUESTION:
 {{question}}
 
 Provide a clear, professional, and well-structured answer.
 """.format(fallback_signal=FALLBACK_SIGNAL))
 
-        rag_chain = (
-            RunnablePassthrough.assign(
-                context=lambda x: self._format_docs(retriever.invoke(x["question"]))
-            )
-            | qa_prompt
-            | self.llm
-            | StrOutputParser()
-        )
-
-        answer = rag_chain.invoke({"question": query})
-        docs   = retriever.invoke(query)
+        chain  = qa_prompt | self.llm | StrOutputParser()
+        answer = chain.invoke({"context": context, "question": query})
 
         return {
             "answer":  answer,
@@ -204,6 +201,7 @@ Provide a clear, professional, and well-structured answer.
                 query,
                 k=6,
                 filter={"paper_id": pid},
+                fetch_k=50,
             )
             docs = [
                 d for d in docs
@@ -245,7 +243,7 @@ respond with exactly:
 
 Otherwise, structure your response as:
 1. A brief section for each of the {n_papers} listed papers summarising its relevant approach.
-2. A side-by-side comparison table with EXACTLY {n_papers} rows — two per listed paper.
+2. A side-by-side comparison table with EXACTLY {n_papers} rows — five per listed paper.
 3. An overall comparative conclusion.
 
 

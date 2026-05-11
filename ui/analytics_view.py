@@ -69,7 +69,7 @@ def render(analyzer: TrendAnalyzer, rag_engine):
     """
     Renders the Trend & Citation Analytics panel.
     """
-    st.header("📈 Research Trend & Citation Analytics")
+    st.header(" Research Trend & Citation Analytics")
 
     if not analyzer.papers:
         st.info(" Upload and index papers to see trend analytics.")
@@ -79,7 +79,7 @@ def render(analyzer: TrendAnalyzer, rag_engine):
         "📊 Library Overview",
         "🏷️ Research Topics",
         "🚀 Emerging Trends",
-        "🔗 Citation Network",
+        "🔗 Citation Statistics",
     ])
 
     # ================================================================== #
@@ -232,7 +232,7 @@ def render(analyzer: TrendAnalyzer, rag_engine):
     #  TAB 4 — CITATION NETWORK
     # ================================================================== #
     with tab4:
-        st.subheader("🔗 Citation Network")
+        st.subheader("🔗 Citation Statistics")
 
         citation_graph = analyzer.get_citation_graph()
 
@@ -299,16 +299,3 @@ def render(analyzer: TrendAnalyzer, rag_engine):
                     hide_index=True,
                 )
 
-            # ── Most referenced external papers ────────────────────────
-            st.divider()
-            st.subheader("📌 Most Referenced External Papers")
-            st.caption("Papers outside your library cited most often across all your papers.")
-
-            external = analyzer.get_most_referenced_external(top_n=10)
-
-            if external:
-                ext_df = pd.DataFrame(external)
-                ext_df.columns = ["Title", "Cited By (count)"]
-                st.dataframe(ext_df, use_container_width=True, hide_index=True)
-            else:
-                st.info("No external references found yet.")

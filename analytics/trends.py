@@ -1,7 +1,7 @@
 import re
 from collections import Counter, defaultdict
 from typing import List, Dict, Any, Optional
-from models.schemas import ResearchPaper, Citation
+from models.schemas import ResearchPaper
 
 
 def _normalize_title(s: str) -> str:
@@ -277,32 +277,21 @@ class TrendAnalyzer:
         title_norm = {p.title: _normalize_title(p.title) for p in self.papers}
 
         # For each paper, resolve which of its raw reference strings point at
-        # another local paper and emit Citation objects + graph edges.
+        # another local paper and build graph edges.
         for paper in self.papers:
             resolved_titles: List[str] = []
-            citations: List[Citation] = []
             for ref in paper.references:
                 for other in self.papers:
                     if other.title == paper.title:
                         continue
                     if _ref_contains_title(ref, title_norm[other.title]):
                         resolved_titles.append(other.title)
-                        citations.append(Citation(
-                            source_paper_id    = paper.paper_id,
-                            target_paper_title = other.title,
-                            target_paper_id    = other.paper_id,
-                            context            = ref[:200],
-                        ))
                         # Reverse edge — other paper is cited by this one.
                         if paper.title not in graph[other.title]["cited_by"]:
                             graph[other.title]["cited_by"].append(paper.title)
                         break  # one local match per ref is enough
 
             graph[paper.title]["references"] = list(dict.fromkeys(resolved_titles))
-            # Backfill `paper.citations` only if empty (don't overwrite anything
-            # a future ingestion step might populate).
-            if not paper.citations:
-                paper.citations = citations
 
         return graph
 

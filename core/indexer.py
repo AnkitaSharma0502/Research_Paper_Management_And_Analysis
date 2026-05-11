@@ -3,6 +3,8 @@ from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 from models.schemas import ResearchPaper, PaperSection
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
+
 from typing import List, Optional
 
 
@@ -12,43 +14,20 @@ SHORT_SECTIONS = {"abstract", "conclusion", "future work", "acknowledgements"}
 
 class ResearchIndexer:
     def __init__(self):
-        """
-        Initialises the embedding model based on EMBEDDING_PROVIDER env var.
 
-        
-        """
-        self.embeddings   = self._init_embeddings()
+        hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
+
+        if not hf_token:
+            raise EnvironmentError(
+                "HUGGINGFACEHUB_API_TOKEN is not set."
+            )
+
+        self.embeddings = HuggingFaceEndpointEmbeddings(
+            model="sentence-transformers/all-MiniLM-L6-v2",
+            huggingfacehub_api_token=hf_token,
+        )
+
         self.vector_store: Optional[FAISS] = None
-
-    # ------------------------------------------------------------------ #
-    #  EMBEDDING INITIALISATION
-    # ------------------------------------------------------------------ #
-
-    def _init_embeddings(self):
-        provider   = os.getenv("EMBEDDING_PROVIDER", "local").strip().lower()
-        model_name = "sentence-transformers/all-MiniLM-L6-v2"
-
-        if provider == "huggingface_api":
-            hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
-            if not hf_token:
-                raise EnvironmentError(
-                    "HUGGINGFACEHUB_API_TOKEN is not set.\n"
-                  
-                )
-            from langchain_huggingface import HuggingFaceEndpointEmbeddings
-            print(" Using HuggingFace Inference API for embeddings.")
-            return HuggingFaceEndpointEmbeddings(
-                model=model_name,
-                huggingfacehub_api_token=hf_token,
-            )
-        else:
-            from langchain_huggingface import HuggingFaceEmbeddings
-            print(" Using local HuggingFace model for embeddings.")
-            return HuggingFaceEmbeddings(
-                model_name=model_name,
-                model_kwargs={"device": "cpu"},
-            )
-
     # ------------------------------------------------------------------ #
     #  CONTENT-AWARE CHUNKING
     # ------------------------------------------------------------------ #
@@ -179,3 +158,6 @@ class ResearchIndexer:
         """Resets the vector store."""
         self.vector_store = None
         print("  Index cleared.")
+
+
+        

@@ -30,12 +30,9 @@ KNOWN_HEADINGS = [
 KNOWN_HEADINGS_SET = {h.lower() for h in KNOWN_HEADINGS}
 
 REFERENCE_PATTERNS = [
-    r'^\[\d+\]\s+.{10,}',
-    r'^\d+\.\s+[A-Z].{10,}',
-    r'^[A-Z][a-z]+,\s+[A-Z]\.?.{10,}',
-    r'.{10,}\(\d{4}\)[.,].{5,}',
-    r'^\d+\.\s+[A-Z][a-z]+\s+[A-Z]{1,3}[.,].{5,}',
-    r'^[A-Z][a-z]+\s+[A-Z]+\s+\(\d{4}\).{5,}',
+    r'^\[\d+\]\s+.+',
+    r'^\d+\.\s+.+',
+    r'^[A-Z][a-z]+,\s+[A-Z]\.?.+',
 ]
 
 VENUE_TOKENS = (
@@ -112,18 +109,15 @@ def _clean_text(text: str, repeating: set) -> str:
     out = []
     for line in text.split("\n"):
         s = line.strip()
-        if len(s) <= 1:
-            out.append(line)
+        if not s:
             continue
-        if s in repeating:
+        if s in repeating: # Remove repeated headers/footers
             continue
-        if re.search(r'\b\d{3,4}[–\-]\d{3,4}\b', s):
-            continue
-        if re.search(r'et al\.\s*\/', s, re.IGNORECASE):
-            continue
-        if re.fullmatch(r'(Page\s+)?\d{1,4}(\s+of\s+\d+)?', s, re.IGNORECASE):
-            continue
-        if re.fullmatch(r'https?://\S+', s):
+        if re.fullmatch(    # Remove page numbers
+            r'(Page\s+)?\d{1,4}(\s+of\s+\d+)?',
+            s,
+            re.IGNORECASE,
+        ):
             continue
         out.append(line)
     return "\n".join(out)
@@ -146,7 +140,7 @@ class PageModel:
         for pi, page in enumerate(self.doc):
             pw, ph = page.rect.width, page.rect.height
             for block in page.get_text("dict").get("blocks", []):
-                if block.get("type", 0) != 0:
+                if block.get("type", 0) != 0: #skip non text blocks
                     continue
                 for ln in block.get("lines", []):
                     spans = ln.get("spans", [])
@@ -170,37 +164,37 @@ class PageModel:
                     ))
         return out
 
-    def _detect_layout(self) -> str:
+    def _detect_layout(self) -> str: #check if paper is 1 or 2 col
         # Vote across first 5 pages — single page is too brittle.
         n = min(5, len(self.doc))
-        if n == 0:
+        if n == 0: #empty doc
             return "scanned"
         votes = {"two_column": 0, "text": 0, "scanned": 0}
         for pi in range(n):
             page = self.doc[pi]
             blocks = [b for b in page.get_text("blocks")
-                      if b[6] == 0 and b[4].strip()]
+                      if b[6] == 0 and b[4].strip()] #b[6]=block type ,b[4]=text,b[6]==0keep only textblock,b[4].strip() ignore empty text
             if not blocks:
                 votes["scanned"] += 1
                 continue
             mid = page.rect.width * 0.45
-            left = [b for b in blocks if b[0] < mid]
+            left = [b for b in blocks if b[0] < mid] #b[0]=x cord of left side
             right = [b for b in blocks if b[0] > mid]
             if len(left) >= 3 and len(right) >= 3:
                 votes["two_column"] += 1
             else:
                 votes["text"] += 1
-        if votes["scanned"] == n:
+        if votes["scanned"] == n:# if all pages are scanned
             return "scanned"
         return "two_column" if votes["two_column"] > votes["text"] else "text"
 
-    def _body_size(self) -> float:
+    def _body_size(self) -> float:#body text size
         sizes = [round(l.size, 1) for l in self.lines if len(l.text) > 20]
         if not sizes:
             return 10.0
         return Counter(sizes).most_common(1)[0][0]
 
-    def _repeating_lines(self) -> set:
+    def _repeating_lines(self) -> set:#detect repeating header and footer
         # Compute on normalized text so matching survives _clean_text().
         page_map: Dict[str, set] = defaultdict(set)
         for l in self.lines:
@@ -209,7 +203,7 @@ class PageModel:
                 page_map[t].add(l.page)
         return {t for t, pages in page_map.items() if len(pages) >= 3}
 
-    def column_aware_text(self) -> str:
+    def column_aware_text(self) -> str: #to read 2 col paper
         if self.layout != "two_column":
             return "\n".join(l.text for l in self.lines)
         out: List[str] = []
@@ -235,7 +229,7 @@ def _validate_title(t: Optional[str]) -> bool:
     if not t:
         return False
     t = t.strip()
-    if len(t) < 10 or len(t) > 250:
+    if len(t) < 9 or len(t) > 250:
         return False
     if t.lower().startswith("microsoft word"):
         return False
@@ -284,7 +278,7 @@ def _validate_abstract(t: Optional[str]) -> bool:
     if not t:
         return False
     t = t.strip()
-    if len(t) < 100 or len(t) > 4000:
+    if len(t) < 100 or len(t) > 4500:
         return False
     if t.count('.') < 2:
         return False
@@ -297,7 +291,7 @@ def _validate_abstract(t: Optional[str]) -> bool:
 
 def _heading_score(line: Line, body_size: float, full_text_lower: str) -> float:
     t = line.text.strip()
-    if not t or len(t) > 120 or len(t) < 2:
+    if not t or len(t) > 150 or len(t) < 2:
         return 0.0
     if re.match(r'^(Fig(ure)?\.?|Table|Algorithm|Listing)\s*\d+',
                 t, re.IGNORECASE):
@@ -348,33 +342,6 @@ def _detect_anchors(pm: PageModel) -> List[HeadingAnchor]:
 #  SECTION SPLIT
 # ─────────────────────────────────────────────────────────────────────
 
-# Author-bio / contact-info markers that often appear at the end of a paper
-# without a proper heading — they bleed into the last real section.
-AUTHOR_BIO_MARKERS = re.compile(
-    r'(?im)^\s*('
-    r'mailing\s+address|e-?mail\s*:|'
-    r'orcid\s*(id)?\s*:?\s*https?|orcid\.org/|'
-    r'\bmobile\s*:|\btel(?:\.|ephone)?\s*:|\bphone\s*:|\bfax\s*:|'
-    r'about\s+the\s+authors?|author\s+biograph(?:y|ies)|biograph(?:y|ies)\s+of\s+author|'
-    r'corresponding\s+author\s*:'
-    r')'
-)
-
-
-def _trim_author_bio(text: str) -> str:
-    """Cuts a trailing author-bio block off a section's content."""
-    if not text:
-        return text
-    m = AUTHOR_BIO_MARKERS.search(text)
-    if not m:
-        return text
-    # Only trim if the bio block is in the latter half — a contact mention
-    # mid-paper (e.g., a corresponding-author footnote on page 1) should stay.
-    if m.start() < len(text) * 0.4:
-        return text
-    return text[:m.start()].rstrip()
-
-
 def _split_sections(pm: PageModel, anchors: List[HeadingAnchor],
                     clean_text: str) -> List[PaperSection]:
     if not anchors:
@@ -392,9 +359,6 @@ def _split_sections(pm: PageModel, anchors: List[HeadingAnchor],
         start = a.line_idx + 1
         end = anchors[i + 1].line_idx if i + 1 < len(anchors) else len(pm.lines)
         body = "\n".join(l.text for l in pm.lines[start:end]).strip()
-        # Trim trailing author-bio block from the LAST section only.
-        if i + 1 == len(anchors):
-            body = _trim_author_bio(body)
         if len(body) >= 30:
             out.append(PaperSection(section_name=a.text, content=body))
     return out
@@ -415,8 +379,6 @@ def _regex_section_fallback(clean_text: str) -> List[PaperSection]:
     for i in range(1, len(parts), 2):
         name = parts[i].strip()
         content = parts[i + 1].strip() if i + 1 < len(parts) else ""
-        if i == last_idx:
-            content = _trim_author_bio(content)
         if len(content) > 30:
             sections.append(PaperSection(section_name=name, content=content))
     return sections
@@ -493,28 +455,36 @@ def extract_title(pm: PageModel, pdf_meta_title: Optional[str]) -> Extracted:
 # ─────────────────────────────────────────────────────────────────────
 #  AUTHOR EXTRACTOR
 # ─────────────────────────────────────────────────────────────────────
-
+# Find title
+# ↓
+# Find abstract
+# ↓
+# Take text between them
+# ↓
+# Estimate which lines look like names
+# ↓
+# Split names
 def _score_author_line(text: str) -> float:
+    text = text.strip()
     if len(text) < 3 or len(text) > 250:
+        return 0.0
+    if '@' in text:
         return 0.0
     if AFFIL_RE.search(text):
         return 0.0
+    if text.lower() in KNOWN_HEADINGS_SET:
+        return 0.0
     if not re.search(r'[A-Z]', text):
         return 0.0
-    tokens = [t.strip() for t in
-              re.split(r'[,;]|\band\b|&|\s+', text, flags=re.IGNORECASE)
-              if t.strip()]
+    tokens = [t.strip() for t in re.split(r'[,;]|\band\b|&|\s+',text,flags=re.IGNORECASE) if t.strip()    ]
     if not tokens:
         return 0.0
     name_like = sum(
-        1 for t in tokens
-        if re.match(r"^[A-Z][A-Za-z\.\-'’]{0,30}$", t)
-        or re.match(r"^[a-z]{2,3}$", t)   # particles: de, van, der
-    )
+   1 for t in tokens
+        if ( re.match(r"^[A-Z][A-Za-z\.\-'’]{0,30}$", t)  or re.match(r"^[a-z]{2,3}$", t))  )
     ratio = name_like / len(tokens)
     digit_pen = 0.3 if re.search(r'\b\d{3,}\b', text) else 0.0
     return max(0.0, min(1.0, ratio - digit_pen))
-
 
 def extract_authors(pm: PageModel, title_text: Optional[str],
                     pdf_meta_authors: Optional[str]) -> Extracted:
@@ -696,7 +666,7 @@ def extract_references(sections: List[PaperSection]) -> Tuple[List[str], str]:
     current = ""
     for line in lines:
         is_new = any(p.match(line) for p in compiled) \
-                 or bool(re.match(r'^(\[\d+\]|\d+[\.\)])', line))
+                 or bool(re.match( r'^(\\[\\d+\\]|\\d+[\\.\\)])', line))
         if is_new and current:
             if len(current) > 20:
                 refs.append(current.strip())

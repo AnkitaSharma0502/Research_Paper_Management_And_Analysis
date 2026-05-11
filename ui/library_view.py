@@ -4,44 +4,11 @@ from core.parser import PDFParser
 import hashlib
 import tempfile
 import os
-import re
 
 
 # ------------------------------------------------------------------ #
 #  HELPERS
 # ------------------------------------------------------------------ #
-
-def _extract_doi(text: str):
-    """Extracts a DOI from a reference string if present."""
-    doi_match = re.search(
-        r'10\.\d{4,9}/[-._;()/:A-Z0-9a-z]+',
-        text
-    )
-    return doi_match.group() if doi_match else None
-
-
-def _extract_url(text: str):
-    """Extracts a plain URL from a reference string if present."""
-    url_match = re.search(r'https?://\S+', text)
-    return url_match.group().rstrip('.,)') if url_match else None
-
-
-def _render_reference(ref: str, index: int):
-    """
-    Renders a single reference with a clickable DOI or URL link if found.
-    """
-    doi = _extract_doi(ref)
-    url = _extract_url(ref)
-
-    if doi:
-        link    = f"https://doi.org/{doi}"
-        display = ref.replace(doi, "").strip().rstrip('.,')
-        st.markdown(f"{index}. {display} — [🔗 DOI]({link})")
-    elif url:
-        display = ref.replace(url, "").strip().rstrip('.,')
-        st.markdown(f"{index}. {display} — [🔗 Link]({url})")
-    else:
-        st.markdown(f"{index}. {ref}")
 
 
 def _reading_progress(paper_store: dict) -> dict:
@@ -190,6 +157,10 @@ def render(indexer, paper_store: dict):
                     paper_store[p_id].year           = int(year_val) if pd.notna(year_val) else None
                     paper_store[p_id].venue          = row["Venue"] or None
                     paper_store[p_id].reading_status = row["Status"]
+            # Rebuild FAISS so chunk metadata (year, venue) stays in sync
+            indexer.clear_index()
+            for paper in paper_store.values():
+                indexer.index_paper(paper)
             st.success("✅ Metadata synced!")
             st.rerun()
 
@@ -197,6 +168,15 @@ def render(indexer, paper_store: dict):
         if st.button("🗑️ Clear All", use_container_width=True):
             st.session_state.paper_store = {}
             indexer.clear_index()
+            # Clear all derived caches so nothing from deleted papers lingers
+            keys_to_remove = [
+                k for k in st.session_state
+                if k.startswith("summary_")
+                or k.startswith("chat_history_")
+                or k in ("paper_categories", "category_paper_ids")
+            ]
+            for k in keys_to_remove:
+                st.session_state.pop(k, None)
             st.rerun()
 
     # ------------------------------------------------------------------ #
@@ -262,29 +242,9 @@ def render(indexer, paper_store: dict):
                 st.caption("Click to generate a Short + Structured summary using the LLM.")
 
 
-    # ── References with clickable DOI/URL links ───────────────────────
+    # ── References ───────────────────────────────────────────
     with st.expander("🔗 References"):
-        if paper.references:
-            st.caption(f"{len(paper.references)} references extracted")
-            for idx, ref in enumerate(paper.references, 1):
-                _render_reference(ref, idx)
-
-            # Raw reference text toggle
-            if paper.raw_references:
-                if st.toggle("Show raw reference text", key=f"raw_ref_{selected_id}"):
-                    st.text_area(
-                        label            = "Raw",
-                        value            = paper.raw_references,
-                        height           = 200,
-                        disabled         = True,
-                        label_visibility = "collapsed",
-                    )
-
-        elif paper.raw_references:
-            st.caption(
-                "References shown as raw text "
-                "(format not recognized for individual parsing)"
-            )
+        if paper.raw_references:
             st.text_area(
                 label            = "Raw References",
                 value            = paper.raw_references,

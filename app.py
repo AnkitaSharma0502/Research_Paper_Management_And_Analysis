@@ -1,7 +1,6 @@
 import streamlit as st
 import os
 from dotenv import load_dotenv
-
 from core.indexer import ResearchIndexer
 from core.rag_pipeline import ResearchRAG
 from core.agent import ResearchAgent
@@ -51,7 +50,7 @@ if "rag_engine" not in st.session_state or "research_agent" not in st.session_st
 #  SIDEBAR
 # ------------------------------------------------------------------ #
 with st.sidebar:
-    st.title(" Research Assistant")
+    st.title("Research Assistant")
     st.markdown("---")
 
     page = st.radio(
@@ -72,7 +71,8 @@ with st.sidebar:
     st.caption(f"Index status: {' Ready' if indexed else '⚠️ Empty'}")
 
     st.markdown("---")
-    st.caption("Powered by LangChain · Groq · FAISS · Streamlit")
+    st.caption("Powered by \n LangChain · Groq · FAISS · Streamlit")
+    st.markdown("---")
 
 # ------------------------------------------------------------------ #
 #  PAGE ROUTING

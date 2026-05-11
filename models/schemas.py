@@ -8,14 +8,6 @@ class PaperSection(BaseModel):
     content: str      = Field(..., description="The raw text content of this section")
 
 
-class Citation(BaseModel):
-    """Represents a citation relationship between papers."""
-    source_paper_id:   str
-    target_paper_title: str
-    target_paper_id:   Optional[str] = None
-    context: Optional[str] = Field(None, description="Text surrounding the citation")
-
-
 class ResearchPaper(BaseModel):
     """The unified internal representation of a research paper."""
     paper_id:  str
@@ -36,17 +28,11 @@ class ResearchPaper(BaseModel):
         default_factory=list,
         description="Parsed individual reference strings",
     )
-
    
     # Used as fallback display when individual parsing fails
     raw_references: Optional[str] = Field(
         None,
         description="Raw reference section text — shown when parsing into individual refs fails",
-    )
-
-    citations: List[Citation] = Field(
-        default_factory=list,
-        description="Citation objects with context (cited_by relationships)",
     )
 
     page_count: Optional[int] = None

@@ -1,7 +1,7 @@
 from typing import Dict, List, Optional
 
 from langchain_groq import ChatGroq
-from langchain_core.tools import tool
+from langchain_core.tools import tool, StructuredTool
 from langchain_core.messages import AIMessage, ToolMessage
 from langchain.agents import create_agent
 
@@ -14,16 +14,15 @@ Decide which tool fits the user's question:
 - local_library_search: questions about papers the user has uploaded (datasets, methods, results, contributions of a specific paper in their library).
 - paper_metadata_lookup: a paper's year, venue, citation count, or authors — especially when the paper is NOT in the local library.
 - related_work_discovery: finding papers related to or cited by a given paper.
-- trend_analytics_tool: publication frequency, emerging subtopics, or trends for a research area.
 
 Rules:
 - Always try local_library_search first when the question references "this paper", "the paper", or anything that sounds like the user's own library.
 - For metadata about a specific external paper, prefer paper_metadata_lookup over web search.
 - When citing local-library results, mention the paper title and section.
 - Be concise and grounded. Do not invent results.
-- If a tool explicitly says metadata/citations are unavailable, tell the user
-  exactly that — do NOT pad the answer with generic instructions like
-  "go to Google Scholar" or "use Crossref". Short, honest answers beat fluff.
+- Call each tool at most ONCE per query. If the tool result is unhelpful, report that honestly — do NOT retry the same tool with the same input.
+- If a tool explicitly says metadata/citations are unavailable, tell the user exactly that — do NOT pad the answer with generic instructions like "go to Google Scholar" or "use Crossref". Short, honest answers beat fluff.
+- When a tool returns URLs or links, ALWAYS include them in your answer so the user can click through to the paper.
 """
 
 
@@ -40,11 +39,47 @@ class ResearchAgent:
             temperature=0,
         )
 
+    @staticmethod
+    def _wrap_with_dedup(tools: list) -> list:
+        """
+        Wrap each tool so that calling it twice with identical arguments
+        returns the cached result instead of hitting the API again.
+        This prevents the agent from looping on the same tool call when
+        the first response is slow or initially unhelpful.
+        """
+        wrapped = []
+        for t in tools:
+            cache: dict = {}
+            original_func = t.func
+
+            def make_cached(func, tool_cache):
+                def cached_func(**kwargs):
+                    key = str(sorted(kwargs.items()))
+                    if key in tool_cache:
+                        return tool_cache[key]
+                    result = func(**kwargs)
+                    # Cache everything — success or failure — so the agent never
+                    # calls the same tool+input more than once per query.
+                    # Retrying a failed call won't help (same rate-limit window);
+                    # the shared _paper_id_cache in mcp_tools handles cross-tool reuse.
+                    tool_cache[key] = result
+                    return result
+                return cached_func
+
+            wrapped.append(StructuredTool(
+                name=t.name,
+                description=t.description,
+                args_schema=t.args_schema,
+                func=make_cached(original_func, cache),
+            ))
+        return wrapped
+
     def _build_local_search_tool(self, vector_store, paper_id: Optional[str]):
         """Wraps the FAISS retriever as a tool. Closes over vector_store + paper_id."""
         search_kwargs: dict = {"k": 5}
         if paper_id:
             search_kwargs["filter"] = {"paper_id": paper_id}
+            search_kwargs["fetch_k"] = 50
 
         captured_sources: List[dict] = []
 
@@ -89,7 +124,7 @@ class ResearchAgent:
         local_search, captured_sources = self._build_local_search_tool(
             vector_store, paper_id
         )
-        tools = [local_search] + mcp_tools_list
+        tools = [local_search] + self._wrap_with_dedup(mcp_tools_list)
 
         if paper_title:
             user_content = (
